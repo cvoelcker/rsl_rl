@@ -5,6 +5,7 @@
 
 """Helper functions."""
 
+from .hl_gauss import embed_targets, HLGaussLayer, HLGaussTransform
 from .utils import (
     get_param,
     resolve_nn_activation,
@@ -16,7 +17,10 @@ from .utils import (
 )
 
 __all__ = [
+    "embed_targets",
     "get_param",
+    "HLGaussLayer",
+    "HLGaussTransform",
     "resolve_nn_activation",
     "resolve_obs_groups",
     "resolve_optimizer",

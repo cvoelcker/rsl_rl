@@ -28,6 +28,7 @@ class RolloutStorage:
             self.actions: torch.Tensor | None = None
             self.privileged_actions: torch.Tensor | None = None
             self.rewards: torch.Tensor | None = None
+            self.soft_rewards: torch.Tensor | None = None
             self.dones: torch.Tensor | None = None
             self.values: torch.Tensor | None = None
             self.actions_log_prob: torch.Tensor
@@ -60,6 +61,7 @@ class RolloutStorage:
             device=self.device,
         )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.soft_rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -92,6 +94,7 @@ class RolloutStorage:
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.soft_rewards[self.step].copy_(transition.soft_rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
