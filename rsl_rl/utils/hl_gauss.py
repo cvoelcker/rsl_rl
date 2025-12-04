@@ -139,7 +139,7 @@ class HLGaussLayer(nn.Module):
         values = self.transform.decode(logits)
 
         if return_logits:
-            return values, logits
+            return values, torch.log_softmax(logits, dim=-1)
         return values
 
     def embed_targets(self, targets: Tensor) -> Tensor:

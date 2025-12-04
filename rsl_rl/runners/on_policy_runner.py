@@ -11,7 +11,7 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms import REPPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,

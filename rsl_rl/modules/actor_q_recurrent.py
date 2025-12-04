@@ -8,17 +8,18 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
 from tensordict import TensorDict
+from torch import Tensor
 from torch.distributions import Normal
 from typing import Any, NoReturn
 
-from rsl_rl.networks import MLP, EmpiricalNormalization
+from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState, Memory, TanhNormal
 from rsl_rl.utils.hl_gauss import HLGaussLayer, embed_targets
-from rsl_rl.networks import TanhNormal
 
 
-class ActorQ(nn.Module):
-    is_recurrent: bool = False
+class ActorQRecurrent(nn.Module):
+    is_recurrent: bool = True
 
     def __init__(
         self,
@@ -39,11 +40,22 @@ class ActorQ(nn.Module):
         distribution_type: str = "normal",
         init_alpha_temp: float = 0.1,
         init_alpha_kl: float = 0.1,
+        rnn_type: str = "lstm",
+        rnn_hidden_dim: int = 256,
+        rnn_num_layers: int = 1,
         **kwargs: dict[str, Any],
     ) -> None:
+        if "rnn_hidden_size" in kwargs:
+            warnings.warn(
+                "The argument `rnn_hidden_size` is deprecated and will be removed in a future version. "
+                "Please use `rnn_hidden_dim` instead.",
+                DeprecationWarning,
+            )
+            if rnn_hidden_dim == 256:  # Only override if the new argument is at its default
+                rnn_hidden_dim = kwargs.pop("rnn_hidden_size")
         if kwargs:
             print(
-                "ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
+                "ActorQRecurrent.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
         super().__init__()
 
@@ -51,11 +63,11 @@ class ActorQ(nn.Module):
         self.obs_groups = obs_groups
         num_actor_obs = 0
         for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            assert len(obs[obs_group].shape) == 2, "The ActorQRecurrent module only supports 1D observations."
             num_actor_obs += obs[obs_group].shape[-1]
         num_critic_obs = num_actions
         for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            assert len(obs[obs_group].shape) == 2, "The ActorQRecurrent module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
         # save activation
@@ -69,13 +81,14 @@ class ActorQ(nn.Module):
         else:
             raise ValueError(f"Unknown activation function: {self.activation}")
 
-
         # Actor
         self.state_dependent_std = state_dependent_std
+        self.memory_a = Memory(num_actor_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
         if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = MLP(rnn_hidden_dim, [2, num_actions], actor_hidden_dims, activation)
         else:
-            self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
+            self.actor = MLP(rnn_hidden_dim, num_actions, actor_hidden_dims, activation)
+        print(f"Actor RNN: {self.memory_a}")
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization
@@ -94,7 +107,8 @@ class ActorQ(nn.Module):
         self.num_critic_bins = num_critic_bins
         self.vmin = vmin
         self.vmax = vmax
-        self.critic = MLP(num_critic_obs, critic_hidden_dims[-1], critic_hidden_dims[:-1], activation)
+        self.memory_c = Memory(num_critic_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
+        self.critic = MLP(rnn_hidden_dim, critic_hidden_dims[-1], critic_hidden_dims[:-1], activation)
         self.critic_embedding_layer = HLGaussLayer(
             in_features=critic_hidden_dims[-1],
             min_value=vmin,
@@ -102,6 +116,7 @@ class ActorQ(nn.Module):
             num_bins=num_critic_bins,
             sigma=0.75,
         )
+        print(f"Critic RNN: {self.memory_c}")
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization
@@ -158,12 +173,6 @@ class ActorQ(nn.Module):
     def alpha_kl(self) -> torch.Tensor:
         return self.log_alpha_kl.exp()
 
-    def reset(self, dones: torch.Tensor | None = None) -> None:
-        pass
-
-    def forward(self) -> NoReturn:
-        raise NotImplementedError
-
     @property
     def action_mean(self) -> torch.Tensor:
         return self.distribution.mean
@@ -175,6 +184,13 @@ class ActorQ(nn.Module):
     @property
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        self.memory_a.reset(dones)
+        self.memory_c.reset(dones)
+
+    def forward(self) -> NoReturn:
+        raise NotImplementedError
 
     def _update_distribution(self, obs: torch.Tensor) -> None:
         if self.state_dependent_std:
@@ -203,26 +219,36 @@ class ActorQ(nn.Module):
         elif self.distribution_type == "tanh":
             self.distribution = TanhNormal(mean, std)
 
-    def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+    def act(self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        self._update_distribution(obs)
+        out_mem = self.memory_a(obs, masks, hidden_state).squeeze(0)
+        self._update_distribution(out_mem)
         return self.distribution.sample()
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
+        out_mem = self.memory_a(obs).squeeze(0)
         if self.state_dependent_std:
-            return self.actor(obs)[..., 0, :]
+            return self.actor(out_mem)[..., 0, :]
         else:
-            return self.actor(obs)
+            return self.actor(out_mem)
 
-    def evaluate(self, obs: TensorDict, act: Tensor, return_logits: bool = False) -> torch.Tensor:
+    def evaluate(
+        self,
+        obs: TensorDict,
+        act: Tensor,
+        masks: torch.Tensor | None = None,
+        hidden_state: HiddenState = None,
+        return_logits: bool = False,
+    ) -> torch.Tensor:
         obs = self.get_critic_obs(obs)
+        obs = torch.cat([obs, act], dim=-1)
         obs = self.critic_obs_normalizer(obs)
-        embeddings = self.critic(obs, act)
+        out_mem = self.memory_c(obs, masks, hidden_state).squeeze(0)
+        embeddings = self.critic(out_mem)
         return self.critic_embedding_layer(self.activation_fn(embeddings), return_logits=return_logits)
-
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]
@@ -234,6 +260,9 @@ class ActorQ(nn.Module):
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def get_hidden_states(self) -> tuple[HiddenState, HiddenState]:
+        return self.memory_a.hidden_state, self.memory_c.hidden_state
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:

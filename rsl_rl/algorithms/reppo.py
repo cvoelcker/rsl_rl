@@ -17,15 +17,15 @@ from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 
 
-class PPO:
-    """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
+class REPPO:
+    """Relative Entropy Pathwise Policy Optimization algorithm ()."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN
+    policy: ActorQ | ActorQCNN | ActorQRecurrent
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN,
+        policy: ActorQ | ActorQCNN | ActorQRecurrent,
         storage: RolloutStorage,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
@@ -101,6 +101,11 @@ class PPO:
         self.policy = policy
         self.policy.to(self.device)
 
+        # old policy (for KL computation)
+        self.old_policy = copy.deepcopy(self.policy)
+        self.old_policy.to(self.device)
+        self.old_policy.eval()
+
         # Create the optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
@@ -108,11 +113,9 @@ class PPO:
         self.storage = storage
         self.transition = RolloutStorage.Transition()
 
-        # PPO parameters
-        self.clip_param = clip_param
+        # REPPO parameters
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
-        self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
         self.gamma = gamma
         self.lam = lam
@@ -130,6 +133,7 @@ class PPO:
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs, self.transition.actions).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.soft_rewards = self.transition.rewards - self.policy.alpha_temp * self.transition.actions_log_prob
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # Record observations before env.step()
@@ -179,16 +183,12 @@ class PPO:
             # 1 if we are not in a terminal state, 0 otherwise
             next_is_not_terminal = 1.0 - st.dones[step].float()
             # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-            delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+            delta = st.soft_rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
-        # Compute the advantages
-        st.advantages = st.returns - st.values
-        # Normalize the advantages if per minibatch normalization is not used
-        if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+        
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -209,22 +209,17 @@ class PPO:
         for (
             obs_batch,
             actions_batch,
-            target_values_batch,
-            advantages_batch,
+            _,
+            _,
             returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
+            _,
+            _,
+            _,
             hidden_states_batch,
             masks_batch,
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
-
-            # Check if we should normalize advantages per mini batch
-            if self.normalize_advantage_per_mini_batch:
-                with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -239,129 +234,71 @@ class PPO:
                 # Compute number of augmentations per sample
                 num_aug = int(obs_batch.batch_size[0] / original_batch_size)
                 # Repeat the rest of the batch
-                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
-                target_values_batch = target_values_batch.repeat(num_aug, 1)
-                advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
-            actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             # Note: We only keep the entropy of the first augmentation (the original one)
-            mu_batch = self.policy.action_mean[:original_batch_size]
-            sigma_batch = self.policy.action_std[:original_batch_size]
-            entropy_batch = self.policy.entropy[:original_batch_size]
+            entropy_batch = self.policy.entropy
 
-            # Compute KL divergence and adapt the learning rate
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    )
-                    kl_mean = torch.mean(kl)
+            # get current actor critic outputs
+            predicted_policy = self.policy.act(obs_batch, hidden_states_batch, masks_batch)
+            predicted_actions = predicted_policy.rsample()
+            observed_values, value_logits = self.policy.evaluate(obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True)
+            on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
 
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+            # VALUE LOSS
+            # embed the returns
+            embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape)
+            # compute loss
+            value_loss = -(embedded_returns * value_logits).sum(-1).mean()
 
-                    # Update the learning rate only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+            # POLICY LOSS
+            q_loss = -on_policy_values.mean()
+            # temperature component
+            entropy = - predicted_policy.log_prob(predicted_actions)
+            entropy_loss = self.policy.alpha_temp.detach() * entropy.mean()
+            primary_policy_loss = q_loss + entropy_loss
 
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
+            # KL computation
+            old_policy_distribution = self.old_policy.get_actions_distribution(obs_batch, hidden_states_batch, masks_batch)
+            old_policy_actions = old_policy_distribution.rsample()
+            log_prob_old = old_policy_distribution.log_prob(old_policy_actions)
+            log_prob_new = self.policy.get_actions_log_prob(old_policy_actions, hidden_states_batch, masks_batch)
+            kl_divergence = (log_prob_old - log_prob_new).sum(-1)
 
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+            # Clipped Policy Loss
+            policy_loss = torch.where((kl_divergence > self.desired_kl).detach(), primary_policy_loss, self.policy.temp_kl.detach() * kl_divergence)
 
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # temperature updates TODO: double check signs carefully!!!
+            temp_target_loss = - self.policy.alpha_temp * (entropy + self.target_entropy).detach().mean()
+            kl_target_loss = self.policy.temp_kl * (kl_divergence - self.desired_kl).detach().mean()
 
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
-
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # FULL LOSS
+            # Compute the gradients in two passes:
+            # 1. Value loss backward (updates critic)
+            # 2. Policy loss backward with frozen critic (only updates actor)
 
             # Symmetry loss
             if self.symmetry:
-                # Obtain the symmetric actions
-                # Note: If we did augmentation before then we don't need to augment again
-                if not self.symmetry["use_data_augmentation"]:
-                    data_augmentation_func = self.symmetry["data_augmentation_func"]
-                    obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
-                    # Compute number of augmentations per sample
-                    num_aug = int(obs_batch.shape[0] / original_batch_size)
-
-                # Actions predicted by the actor for symmetrically-augmented observations
-                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
-
-                # Compute the symmetrically augmented actions
-                # Note: We are assuming the first augmentation is the original one. We do not use the action_batch from
-                # earlier since that action was sampled from the distribution. However, the symmetry loss is computed
-                # using the mean of the distribution.
-                action_mean_orig = mean_actions_batch[:original_batch_size]
-                _, actions_mean_symm_batch = data_augmentation_func(
-                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
-                )
-
-                # Compute the loss
-                mse_loss = torch.nn.MSELoss()
-                symmetry_loss = mse_loss(
-                    mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
-                )
-                # Add the loss to the total loss
-                if self.symmetry["use_mirror_loss"]:
-                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
-                else:
-                    symmetry_loss = symmetry_loss.detach()
-
-            # RND loss
-            # TODO: Move this processing to inside RND module.
+                raise NotImplementedError("Symmetry loss not implemented yet.")
             if self.rnd:
-                # Extract the rnd_state
-                # TODO: Check if we still need torch no grad. It is just an affine transformation.
-                with torch.no_grad():
-                    rnd_state_batch = self.rnd.get_rnd_state(obs_batch[:original_batch_size])
-                    rnd_state_batch = self.rnd.state_normalizer(rnd_state_batch)
-                # Predict the embedding and the target
-                predicted_embedding = self.rnd.predictor(rnd_state_batch)
-                target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # Compute the loss as the mean squared error
-                mseloss = torch.nn.MSELoss()
-                rnd_loss = mseloss(predicted_embedding, target_embedding)
+                raise NotImplementedError("RND loss not implemented yet.")
 
-            # Compute the gradients for PPO
+            # Compute the gradients
             self.optimizer.zero_grad()
-            loss.backward()
+
+            # First pass: value loss (updates critic parameters)
+            value_loss.backward(retain_graph=True)
+
+            # Second pass: policy loss with frozen critic
+            # Freeze critic parameters to prevent policy loss from updating them
+            self._set_critic_grad(False)
+            actor_loss = policy_loss + temp_target_loss + kl_target_loss
+            actor_loss.backward()
+            # Unfreeze critic parameters
+            self._set_critic_grad(True)
+
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
@@ -457,3 +394,20 @@ class PPO:
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # Update the offset for the next parameter
                 offset += numel
+
+    def _set_critic_grad(self, requires_grad: bool) -> None:
+        """Enable or disable gradient computation for critic parameters.
+
+        This is used to prevent the policy loss from updating critic parameters
+        while still allowing gradients to flow through the critic to the actor.
+
+        Args:
+            requires_grad: Whether to enable gradient computation for critic parameters.
+        """
+        for param in self.policy.critic.parameters():
+            param.requires_grad = requires_grad
+        for param in self.policy.critic_embedding_layer.parameters():
+            param.requires_grad = requires_grad
+        if self.policy.is_recurrent:
+            for param in self.policy.memory_c.parameters():
+                param.requires_grad = requires_grad
