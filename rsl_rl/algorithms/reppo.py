@@ -147,10 +147,6 @@ class REPPO:
         self.transition.dones = dones
         self.transition.truncations = extras["time_outs"].to(self.device) * 1.0
 
-        self.transition.soft_rewards = (
-            self.transition.rewards - self.gamma * self.policy.alpha_temp * self.transition.actions_log_prob
-        )
-
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
             # Compute the intrinsic rewards
@@ -161,6 +157,10 @@ class REPPO:
         # Bootstrapping on time outs
         if "time_outs" in extras:
             self.transition.rewards += self.gamma * self.transition.values * extras["time_outs"].to(self.device)
+
+        self.transition.soft_rewards = (
+            self.transition.rewards - self.gamma * self.policy.alpha_temp * self.transition.actions_log_prob
+        )
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -317,7 +317,7 @@ class REPPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
