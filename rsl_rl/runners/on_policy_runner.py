@@ -89,7 +89,14 @@ class OnPolicyRunner:
                 for _ in range(self.cfg["num_steps_per_env"]):
                     # Sample actions
                     actions = self.alg.act(obs)
+                    # scale actions
+                    if self.alg_cfg.get("scale_actions", False):
+                        upper = self.alg_cfg.get("action_upper_bound", 1.0)
+                        lower = self.alg_cfg.get("action_lower_bound", -1.0)
+                        actions = actions * (upper - lower) / 2.0 + (upper + lower) / 2.0
+
                     # Step the environment
+                    # print("mean abs actions: ", actions.abs().mean())  # DEBUG
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))

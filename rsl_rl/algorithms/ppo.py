@@ -148,6 +148,7 @@ class PPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        self.transition.truncations = extras["time_outs"].to(self.device) * 1.0
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -212,6 +213,7 @@ class PPO:
             target_values_batch,
             advantages_batch,
             returns_batch,
+            _,
             old_actions_log_prob_batch,
             old_mu_batch,
             old_sigma_batch,

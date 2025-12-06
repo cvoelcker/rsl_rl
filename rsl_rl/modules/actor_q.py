@@ -102,7 +102,7 @@ class ActorQ(nn.Module):
             max_value=vmax,
             num_bins=num_critic_bins,
             sigma=0.75,
-            offset_mult=40.0
+            offset_mult=40.0,
         )
         print(f"Critic MLP: {self.critic}")
 
@@ -116,15 +116,20 @@ class ActorQ(nn.Module):
         # Action noise
         self.noise_std_type = noise_std_type
         if self.state_dependent_std:
-            torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
-            if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
-            elif self.noise_std_type == "log":
-                torch.nn.init.constant_(
-                    self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
-                )
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            pass
+        #     torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
+        #     if self.noise_std_type == "scalar":
+        #         torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
+        #     elif self.noise_std_type == "log":
+        #         torch.nn.init.constant_(
+        #             self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
+        #         )
+        #     elif self.noise_std_type == "sigmoid":
+        #         torch.nn.init.constant_(
+        #             self.actor[-2].bias[num_actions:], -torch.log(torch.tensor((1.0 / init_noise_std) - 1.0) + 1e-7)
+        #         )
+        #     else:
+        #         raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:
             if self.noise_std_type == "scalar":
                 self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -143,7 +148,7 @@ class ActorQ(nn.Module):
         self.log_alpha_kl = nn.Parameter(torch.log(torch.tensor(init_alpha_kl)))
 
         # set magic 0 embedding
-        self.norm = nn.RMSNorm(critic_hidden_dims[-1])
+        self.norm = nn.LayerNorm(critic_hidden_dims[-1])
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -155,7 +160,7 @@ class ActorQ(nn.Module):
             max_value=self.vmax,
             num_bins=self.num_critic_bins,
         )
-    
+
     def hlgauss_decode(self, logits: torch.Tensor) -> torch.Tensor:
         return self.critic_embedding_layer.transform.decode(logits)
 
@@ -193,7 +198,10 @@ class ActorQ(nn.Module):
                 mean, std = torch.unbind(mean_and_std, dim=-2)
             elif self.noise_std_type == "log":
                 mean, log_std = torch.unbind(mean_and_std, dim=-2)
-                std = torch.exp(log_std)
+                std = torch.exp(log_std) + 1e-4
+            elif self.noise_std_type == "sigmoid":
+                mean, logit_std = torch.unbind(mean_and_std, dim=-2)
+                std = torch.sigmoid(logit_std) + 1e-4
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:

@@ -13,14 +13,14 @@ from torch import Tensor
 class HLGaussTransform:
     """Utility class for HL-Gauss target embedding and value reconstruction.
 
-    Converts scalar values to soft categorical targets using Gaussian smoothing,
-    and reconstructs scalar values from categorical distributions.
+    Converts scalar values to soft categorical targets using Gaussian smoothing
+    via CDF integration over bin intervals.
 
     Args:
         min_value: Minimum value of the support range.
         max_value: Maximum value of the support range.
         num_bins: Number of bins in the discretization.
-        sigma: Standard deviation for Gaussian smoothing (default: 0.75).
+        sigma_ratio: Ratio of sigma to bin width (default: 0.75).
     """
 
     def __init__(
@@ -28,27 +28,36 @@ class HLGaussTransform:
         min_value: float,
         max_value: float,
         num_bins: int,
-        sigma: float = 0.75,
+        sigma_ratio: float = 0.75,
     ):
         self.min_value = min_value
         self.max_value = max_value
         self.num_bins = num_bins
-        self.sigma = sigma
 
-        # Compute bin centers (support)
-        self.support = torch.linspace(min_value, max_value, num_bins)
+        # Compute bin width and sigma
         self.bin_width = (max_value - min_value) / (num_bins - 1)
+        self.sigma = self.bin_width * sigma_ratio
+
+        # Compute bin edges (num_bins + 1 points)
+        self.bin_edges = torch.linspace(
+            min_value - self.bin_width / 2,
+            max_value + self.bin_width / 2,
+            num_bins + 1,
+        )
+        # Compute bin centers for decoding
+        self.support = torch.linspace(min_value, max_value, num_bins)
 
     def to(self, device: torch.device) -> "HLGaussTransform":
-        """Move support tensor to specified device."""
+        """Move tensors to specified device."""
+        self.bin_edges = self.bin_edges.to(device)
         self.support = self.support.to(device)
         return self
 
     def embed_targets(self, targets: Tensor) -> Tensor:
         """Convert scalar targets to soft categorical distributions.
 
-        Uses Gaussian smoothing to create soft targets, which provides better
-        gradients than hard one-hot encodings.
+        Uses CDF-based Gaussian smoothing to create soft targets by integrating
+        a Gaussian over each bin interval.
 
         Args:
             targets: Scalar target values of shape (...,).
@@ -59,18 +68,22 @@ class HLGaussTransform:
         # Clamp targets to valid range
         targets = targets.clamp(self.min_value, self.max_value)
 
-        # Compute distances to each bin center
-        # targets: (...,) -> (..., 1), support: (num_bins,)
-        support = self.support.to(targets.device)
-        distances = targets.unsqueeze(-1) - support
+        # Move bin edges to target device
+        bin_edges = self.bin_edges.to(targets.device)
 
-        # Apply Gaussian kernel
-        log_probs = -0.5 * (distances / self.sigma) ** 2
+        # Compute CDF at each bin edge
+        # targets: (...,) -> (..., 1), bin_edges: (num_bins + 1,)
+        # Result: (..., num_bins + 1)
+        cdf_evals = torch.erf((bin_edges - targets.unsqueeze(-1)) / (self.sigma * (2**0.5)))
 
-        # Normalize to get valid probability distribution
-        probs = torch.softmax(log_probs, dim=-1)
+        # Compute bin probabilities as differences between adjacent CDF values
+        target_probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]
 
-        return probs
+        # Normalize to ensure valid probability distribution
+        z = cdf_evals[..., -1:] - cdf_evals[..., :1]
+        target_probs = target_probs / z
+
+        return target_probs
 
     def decode(self, logits: Tensor) -> Tensor:
         """Decode categorical logits to scalar values.
@@ -116,7 +129,6 @@ class HLGaussLayer(nn.Module):
         self.transform = HLGaussTransform(min_value, max_value, num_bins, sigma)
         self.linear = nn.Linear(in_features, num_bins)
         self.offset = nn.Parameter(self.embed_targets(torch.tensor([0.0])) * offset_mult, requires_grad=True)
-        print(self.offset)
 
     @property
     def num_bins(self) -> int:
@@ -178,7 +190,7 @@ def embed_targets(
     min_value: float,
     max_value: float,
     num_bins: int,
-    sigma: float = 0.75,
+    sigma_ratio: float = 0.75,
 ) -> Tensor:
     """Functional interface for embedding scalar targets as soft categorical distributions.
 
@@ -187,17 +199,18 @@ def embed_targets(
         min_value: Minimum value of the support range.
         max_value: Maximum value of the support range.
         num_bins: Number of bins in the discretization.
-        sigma: Standard deviation for Gaussian smoothing (default: 0.75).
+        sigma_ratio: Ratio of sigma to bin width (default: 0.75).
 
     Returns:
         Soft categorical distributions of shape (..., num_bins).
     """
-    transform = HLGaussTransform(min_value, max_value, num_bins, sigma)
+    transform = HLGaussTransform(min_value, max_value, num_bins, sigma_ratio)
     return transform.embed_targets(targets)
+
 
 if __name__ == "__main__":
     # Simple test of HL-Gauss functionality
-    transform = HLGaussTransform(-10.0, 10.0, 21)
+    transform = HLGaussTransform(-15.0, 15.0, 21)
     targets = torch.tensor([-9.0, -5.0, 0.0, 5.0, 9.0])
     soft_targets = transform.embed_targets(targets)
     print("Soft targets:\n", soft_targets)

@@ -44,6 +44,7 @@ class REPPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        **kwargs,
     ) -> None:
         # Device-related parameters
         self.device = device
@@ -104,7 +105,7 @@ class REPPO:
         self.old_policy.eval()
 
         # Create the optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, weight_decay=1e-3, betas=(0.9, 0.95))
 
         # Add storage
         self.storage = storage
@@ -171,7 +172,7 @@ class REPPO:
         st = self.storage
         # Compute value for the last step
         last_action = self.policy.act(obs).detach()
-        last_values = self.policy.evaluate(obs, last_action).detach().view(-1,1)
+        last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
         # Compute returns and advantages
         recurr_value = last_values
         for step in reversed(range(st.num_transitions_per_env)):
@@ -185,7 +186,6 @@ class REPPO:
             recurr_value = st.soft_rewards[step] + (1 - self.lam) * delta_1 + self.lam * delta_n
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = recurr_value
-
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -206,7 +206,7 @@ class REPPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over batches
-        for i , (
+        for i, (
             obs_batch,
             actions_batch,
             _,
@@ -251,23 +251,24 @@ class REPPO:
             embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
 
             # compute loss
-            value_loss = -((1.0 - truncations_batch.view(-1)) * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)).mean()
+            value_loss = -(
+                (1.0 - truncations_batch.view(-1))
+                * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
+            ).mean()
 
             # POLICY LOSS
             # temperature component
-            entropy = -predicted_policy.log_prob(predicted_actions)
-            entropy_loss = self.policy.alpha_temp.detach() * entropy.mean()
-            primary_policy_loss = - (on_policy_values.mean() + entropy_loss)
+            entropy = -predicted_policy.log_prob(predicted_actions).sum(-1)
+            entropy_loss = self.policy.alpha_temp.detach() * entropy
+            primary_policy_loss = -(on_policy_values + entropy_loss)
 
             # KL computation
-            self.old_policy.act(
-                obs_batch, hidden_states_batch, masks_batch
-            )
+            self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
             old_policy_distribution = self.old_policy.distribution
             old_policy_actions = old_policy_distribution.sample((16,))
             log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
             log_prob_new = predicted_policy.log_prob(old_policy_actions)
-            kl_divergence = (log_prob_old - log_prob_new).sum(-1)
+            kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
 
             # Clipped Policy Loss
             policy_loss = torch.where(
@@ -277,8 +278,8 @@ class REPPO:
             ).mean()
 
             # temperature updates TODO: double check signs carefully!!!
-            temp_target_loss = -self.policy.alpha_temp * (entropy + self.target_entropy).detach().mean()
-            kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence).detach().mean()
+            temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
+            kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
 
             # FULL LOSS
             # Compute the gradients in two passes:
@@ -317,7 +318,7 @@ class REPPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            # nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
@@ -330,13 +331,13 @@ class REPPO:
         print("value prediction error: ", (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item())
 
         decoded_returns = self.policy.hlgauss_decode(torch.log(embedded_returns)).detach()
-        print('enc dec error: ', (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item())
-        print('on policy values mean: ', on_policy_values.mean().item())
-        print('entropy: ', entropy.mean().item())
-        print('kl divergence: ', kl_divergence.mean().item())
-        print('entropy target: ', self.target_entropy)
-        print('alpha temp: ', self.policy.alpha_temp.item())
-        print('alpha kl: ', self.policy.alpha_kl.item())
+        print("enc dec error: ", (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item())
+        print("on policy values mean: ", on_policy_values.mean().item())
+        print("entropy: ", entropy.mean().item())
+        print("kl divergence: ", kl_divergence.mean().item())
+        print("entropy target: ", self.target_entropy)
+        print("alpha temp: ", self.policy.alpha_temp.item())
+        print("alpha kl: ", self.policy.alpha_kl.item())
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
