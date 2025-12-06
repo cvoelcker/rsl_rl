@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -29,17 +31,12 @@ class REPPO:
         storage: RolloutStorage,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
-        clip_param: float = 0.2,
         gamma: float = 0.99,
         lam: float = 0.95,
-        value_loss_coef: float = 1.0,
-        entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
-        use_clipped_value_loss: bool = True,
-        schedule: str = "adaptive",
         desired_kl: float = 0.01,
-        normalize_advantage_per_mini_batch: bool = False,
+        target_entropy: float = -1.0,
         device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -116,15 +113,12 @@ class REPPO:
         # REPPO parameters
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
-        self.entropy_coef = entropy_coef
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
-        self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
-        self.schedule = schedule
+        self.target_entropy = target_entropy * self.policy.num_actions
         self.learning_rate = learning_rate
-        self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -133,7 +127,6 @@ class REPPO:
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs, self.transition.actions).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
-        self.transition.soft_rewards = self.transition.rewards - self.policy.alpha_temp * self.transition.actions_log_prob
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # Record observations before env.step()
@@ -152,6 +145,11 @@ class REPPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        self.transition.truncations = extras["time_outs"].to(self.device) * 1.0
+
+        self.transition.soft_rewards = (
+            self.transition.rewards - self.gamma * self.policy.alpha_temp * self.transition.actions_log_prob
+        )
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -162,9 +160,7 @@ class REPPO:
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
-            )
+            self.transition.rewards += self.gamma * self.transition.values * extras["time_outs"].to(self.device)
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -174,21 +170,22 @@ class REPPO:
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
         # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
+        last_action = self.policy.act(obs).detach()
+        last_values = self.policy.evaluate(obs, last_action).detach().view(-1,1)
         # Compute returns and advantages
-        advantage = 0
+        recurr_value = last_values
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
             # 1 if we are not in a terminal state, 0 otherwise
             next_is_not_terminal = 1.0 - st.dones[step].float()
             # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-            delta = st.soft_rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
-            # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
-            advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+            delta_1 = next_is_not_terminal * self.gamma * next_values
+            delta_n = next_is_not_terminal * self.gamma * recurr_value
+            recurr_value = st.soft_rewards[step] + (1 - self.lam) * delta_1 + self.lam * delta_n
             # Return: R_t = A(s_t, a_t) + V(s_t)
-            st.returns[step] = advantage + st.values[step]
-        
+            st.returns[step] = recurr_value
+
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -199,6 +196,9 @@ class REPPO:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
+        with torch.no_grad():
+            self.old_policy.load_state_dict(self.policy.state_dict())
+
         # Get mini batch generator
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -206,18 +206,19 @@ class REPPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over batches
-        for (
+        for i , (
             obs_batch,
             actions_batch,
             _,
             _,
             returns_batch,
+            truncations_batch,
             _,
             _,
             _,
             hidden_states_batch,
             masks_batch,
-        ) in generator:
+        ) in enumerate(generator):
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
 
@@ -236,43 +237,48 @@ class REPPO:
                 # Repeat the rest of the batch
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: We need to do this because we updated the policy with the new parameters
-            # Note: We only keep the entropy of the first augmentation (the original one)
-            entropy_batch = self.policy.entropy
-
             # get current actor critic outputs
-            predicted_policy = self.policy.act(obs_batch, hidden_states_batch, masks_batch)
+            self.policy.act(obs_batch, hidden_states_batch, masks_batch)
+            predicted_policy = self.policy.distribution
             predicted_actions = predicted_policy.rsample()
-            observed_values, value_logits = self.policy.evaluate(obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True)
+            value_prediction, value_logits = self.policy.evaluate(
+                obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
+            )
             on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
 
             # VALUE LOSS
             # embed the returns
-            embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape)
+            embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
+
             # compute loss
-            value_loss = -(embedded_returns * value_logits).sum(-1).mean()
+            value_loss = -((1.0 - truncations_batch.view(-1)) * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)).mean()
 
             # POLICY LOSS
-            q_loss = -on_policy_values.mean()
             # temperature component
-            entropy = - predicted_policy.log_prob(predicted_actions)
+            entropy = -predicted_policy.log_prob(predicted_actions)
             entropy_loss = self.policy.alpha_temp.detach() * entropy.mean()
-            primary_policy_loss = q_loss + entropy_loss
+            primary_policy_loss = - (on_policy_values.mean() + entropy_loss)
 
             # KL computation
-            old_policy_distribution = self.old_policy.get_actions_distribution(obs_batch, hidden_states_batch, masks_batch)
-            old_policy_actions = old_policy_distribution.rsample()
-            log_prob_old = old_policy_distribution.log_prob(old_policy_actions)
-            log_prob_new = self.policy.get_actions_log_prob(old_policy_actions, hidden_states_batch, masks_batch)
+            self.old_policy.act(
+                obs_batch, hidden_states_batch, masks_batch
+            )
+            old_policy_distribution = self.old_policy.distribution
+            old_policy_actions = old_policy_distribution.sample((16,))
+            log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
+            log_prob_new = predicted_policy.log_prob(old_policy_actions)
             kl_divergence = (log_prob_old - log_prob_new).sum(-1)
 
             # Clipped Policy Loss
-            policy_loss = torch.where((kl_divergence > self.desired_kl).detach(), primary_policy_loss, self.policy.temp_kl.detach() * kl_divergence)
+            policy_loss = torch.where(
+                (kl_divergence < self.desired_kl).detach(),
+                primary_policy_loss,
+                self.policy.alpha_kl.detach() * kl_divergence,
+            ).mean()
 
             # temperature updates TODO: double check signs carefully!!!
-            temp_target_loss = - self.policy.alpha_temp * (entropy + self.target_entropy).detach().mean()
-            kl_target_loss = self.policy.temp_kl * (kl_divergence - self.desired_kl).detach().mean()
+            temp_target_loss = -self.policy.alpha_temp * (entropy + self.target_entropy).detach().mean()
+            kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence).detach().mean()
 
             # FULL LOSS
             # Compute the gradients in two passes:
@@ -293,9 +299,11 @@ class REPPO:
 
             # Second pass: policy loss with frozen critic
             # Freeze critic parameters to prevent policy loss from updating them
+
             self._set_critic_grad(False)
             actor_loss = policy_loss + temp_target_loss + kl_target_loss
             actor_loss.backward()
+
             # Unfreeze critic parameters
             self._set_critic_grad(True)
 
@@ -317,14 +325,18 @@ class REPPO:
 
             # Store the losses
             mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_entropy += entropy_batch.mean().item()
-            # RND loss
-            if mean_rnd_loss is not None:
-                mean_rnd_loss += rnd_loss.item()
-            # Symmetry loss
-            if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+            mean_entropy += entropy.mean().item()
+            mean_surrogate_loss += actor_loss.item()
+        print("value prediction error: ", (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item())
+
+        decoded_returns = self.policy.hlgauss_decode(torch.log(embedded_returns)).detach()
+        print('enc dec error: ', (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item())
+        print('on policy values mean: ', on_policy_values.mean().item())
+        print('entropy: ', entropy.mean().item())
+        print('kl divergence: ', kl_divergence.mean().item())
+        print('entropy target: ', self.target_entropy)
+        print('alpha temp: ', self.policy.alpha_temp.item())
+        print('alpha kl: ', self.policy.alpha_kl.item())
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -349,7 +361,6 @@ class REPPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-
         return loss_dict
 
     def broadcast_parameters(self) -> None:
@@ -407,6 +418,8 @@ class REPPO:
         for param in self.policy.critic.parameters():
             param.requires_grad = requires_grad
         for param in self.policy.critic_embedding_layer.parameters():
+            param.requires_grad = requires_grad
+        for param in self.policy.norm.parameters():
             param.requires_grad = requires_grad
         if self.policy.is_recurrent:
             for param in self.policy.memory_c.parameters():

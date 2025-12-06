@@ -148,6 +148,7 @@ class ActorQRecurrent(nn.Module):
 
         # Action distribution
         # Note: Populated in update_distribution
+        self.num_actions = num_actions
         self.distribution = None
 
         # Trainable temperature parameters

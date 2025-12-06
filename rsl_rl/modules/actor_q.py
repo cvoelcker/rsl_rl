@@ -66,9 +66,10 @@ class ActorQ(nn.Module):
             self.activation_fn = F.relu
         elif self.activation == "elu":
             self.activation_fn = F.elu
+        elif self.activation == "swish":
+            self.activation_fn = F.silu
         else:
             raise ValueError(f"Unknown activation function: {self.activation}")
-
 
         # Actor
         self.state_dependent_std = state_dependent_std
@@ -101,13 +102,14 @@ class ActorQ(nn.Module):
             max_value=vmax,
             num_bins=num_critic_bins,
             sigma=0.75,
+            offset_mult=40.0
         )
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
-            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
+            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs - num_actions)
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
@@ -134,10 +136,14 @@ class ActorQ(nn.Module):
         # Action distribution
         # Note: Populated in update_distribution
         self.distribution = None
+        self.num_actions = num_actions
 
         # Trainable temperature parameters
         self.log_alpha_temp = nn.Parameter(torch.log(torch.tensor(init_alpha_temp)))
         self.log_alpha_kl = nn.Parameter(torch.log(torch.tensor(init_alpha_kl)))
+
+        # set magic 0 embedding
+        self.norm = nn.RMSNorm(critic_hidden_dims[-1])
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -149,6 +155,9 @@ class ActorQ(nn.Module):
             max_value=self.vmax,
             num_bins=self.num_critic_bins,
         )
+    
+    def hlgauss_decode(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.critic_embedding_layer.transform.decode(logits)
 
     @property
     def alpha_temp(self) -> torch.Tensor:
@@ -203,7 +212,7 @@ class ActorQ(nn.Module):
         elif self.distribution_type == "tanh":
             self.distribution = TanhNormal(mean, std)
 
-    def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+    def act(self, obs: TensorDict, *args, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         self._update_distribution(obs)
@@ -217,12 +226,14 @@ class ActorQ(nn.Module):
         else:
             return self.actor(obs)
 
-    def evaluate(self, obs: TensorDict, act: Tensor, return_logits: bool = False) -> torch.Tensor:
+    def evaluate(self, obs: TensorDict, act: Tensor, *args, return_logits: bool = False) -> torch.Tensor:
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
-        embeddings = self.critic(obs, act)
+        inp = torch.cat([obs, act], dim=-1)
+        embeddings = self.critic(inp)
+        embeddings = self.activation_fn(embeddings)
+        embeddings = self.norm(embeddings)
         return self.critic_embedding_layer(self.activation_fn(embeddings), return_logits=return_logits)
-
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]

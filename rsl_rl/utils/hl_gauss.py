@@ -109,11 +109,14 @@ class HLGaussLayer(nn.Module):
         max_value: float,
         num_bins: int,
         sigma: float = 0.75,
+        offset_mult: float = 0.0,
     ):
         super().__init__()
 
         self.transform = HLGaussTransform(min_value, max_value, num_bins, sigma)
         self.linear = nn.Linear(in_features, num_bins)
+        self.offset = nn.Parameter(self.embed_targets(torch.tensor([0.0])) * offset_mult, requires_grad=True)
+        print(self.offset)
 
     @property
     def num_bins(self) -> int:
@@ -135,11 +138,11 @@ class HLGaussLayer(nn.Module):
             If return_logits is True: Tuple of (values, logits) where
                 values has shape (...,) and logits has shape (..., num_bins).
         """
-        logits = self.linear(x)
+        logits = self.linear(x) + self.offset
         values = self.transform.decode(logits)
 
         if return_logits:
-            return values, torch.log_softmax(logits, dim=-1)
+            return values, logits
         return values
 
     def embed_targets(self, targets: Tensor) -> Tensor:
@@ -191,3 +194,14 @@ def embed_targets(
     """
     transform = HLGaussTransform(min_value, max_value, num_bins, sigma)
     return transform.embed_targets(targets)
+
+if __name__ == "__main__":
+    # Simple test of HL-Gauss functionality
+    transform = HLGaussTransform(-10.0, 10.0, 21)
+    targets = torch.tensor([-9.0, -5.0, 0.0, 5.0, 9.0])
+    soft_targets = transform.embed_targets(targets)
+    print("Soft targets:\n", soft_targets)
+
+    logits = torch.log(soft_targets + 1e-8)  # Simulate logits
+    decoded_values = transform.decode(logits)
+    print("Decoded values:\n", decoded_values)

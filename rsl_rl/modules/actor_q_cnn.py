@@ -44,10 +44,7 @@ class ActorQCNN(ActorQ):
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
-            print(
-                "ActorQCNN.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs])
-            )
+            print("ActorQCNN.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs]))
         super(ActorQ, self).__init__()
 
         # Get the observation dimensions
@@ -224,6 +221,7 @@ class ActorQCNN(ActorQ):
 
         # Action distribution
         # Note: Populated in update_distribution
+        self.num_actions = num_actions
         self.distribution = None
 
         # Trainable temperature parameters
@@ -297,7 +295,9 @@ class ActorQCNN(ActorQ):
         else:
             return self.actor(mlp_obs)
 
-    def evaluate(self, obs: TensorDict, act: Tensor, return_logits: bool = False, **kwargs: dict[str, Any]) -> torch.Tensor:
+    def evaluate(
+        self, obs: TensorDict, act: Tensor, return_logits: bool = False, **kwargs: dict[str, Any]
+    ) -> torch.Tensor:
         mlp_obs, cnn_obs = self.get_critic_obs(obs)
         # Concatenate action to 1D observations
         mlp_obs = torch.cat([mlp_obs, act], dim=-1)

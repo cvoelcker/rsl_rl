@@ -52,10 +52,12 @@ class MLP(nn.Sequential):
         # Create layers sequentially
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
+        layers.append(nn.RMSNorm(hidden_dims_processed[0]))
         layers.append(activation_mod)
 
         for layer_index in range(len(hidden_dims_processed) - 1):
             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
+            layers.append(nn.RMSNorm(hidden_dims_processed[layer_index + 1]))
             layers.append(activation_mod)
 
         # Add last layer

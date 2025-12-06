@@ -8,15 +8,19 @@ from __future__ import annotations
 import os
 import time
 import torch
+from torch import nn
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import REPPO
+from rsl_rl.algorithms import PPO, REPPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticCNN,
     ActorCriticRecurrent,
+    ActorQ,
+    ActorQCNN,
+    ActorQRecurrent,
     resolve_rnd_config,
     resolve_symmetry_config,
 )
@@ -246,7 +250,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
+    def _construct_algorithm(self, obs: TensorDict) -> PPO | REPPO:
         """Construct the actor-critic algorithm."""
         # Resolve RND config if used
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -268,7 +272,7 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN = actor_critic_class(
+        actor_critic: nn.Module = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
@@ -279,7 +283,7 @@ class OnPolicyRunner:
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(
+        alg: PPO | REPPO = alg_class(
             actor_critic, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

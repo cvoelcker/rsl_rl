@@ -30,6 +30,7 @@ class RolloutStorage:
             self.rewards: torch.Tensor | None = None
             self.soft_rewards: torch.Tensor | None = None
             self.dones: torch.Tensor | None = None
+            self.truncations: torch.Tensor | None = None
             self.values: torch.Tensor | None = None
             self.actions_log_prob: torch.Tensor
             self.action_mean: torch.Tensor | None = None
@@ -64,6 +65,7 @@ class RolloutStorage:
         self.soft_rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.truncations = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # For distillation
         if training_type == "distillation":
@@ -94,8 +96,10 @@ class RolloutStorage:
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
-        self.soft_rewards[self.step].copy_(transition.soft_rewards.view(-1, 1))
+        if transition.soft_rewards is not None:
+            self.soft_rewards[self.step].copy_(transition.soft_rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.truncations[self.step].copy_(transition.truncations.view(-1, 1))
 
         # For distillation
         if self.training_type == "distillation":
@@ -103,7 +107,7 @@ class RolloutStorage:
 
         # For reinforcement learning
         if self.training_type == "rl":
-            self.values[self.step].copy_(transition.values)
+            self.values[self.step].copy_(transition.values.view(-1, 1))
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
@@ -123,7 +127,7 @@ class RolloutStorage:
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
-            yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i]
+            yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i], self.truncations[i]
 
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
@@ -138,6 +142,7 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
+        truncations = self.truncations.flatten(0, 1)
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -157,6 +162,7 @@ class RolloutStorage:
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
+                truncations_batch = truncations[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
@@ -173,6 +179,7 @@ class RolloutStorage:
                     target_values_batch,
                     advantages_batch,
                     returns_batch,
+                    truncations_batch,
                     old_actions_log_prob_batch,
                     old_mu_batch,
                     old_sigma_batch,
