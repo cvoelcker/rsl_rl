@@ -214,127 +214,72 @@ class REPPO:
             returns_batch,
             truncations_batch,
             _,
-            _,
-            _,
+            old_mean_batch,
+            old_std_batch,
             hidden_states_batch,
             masks_batch,
         ) in enumerate(generator):
-            num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
-            original_batch_size = obs_batch.batch_size[0]
 
-            # Perform symmetric augmentation
-            if self.symmetry and self.symmetry["use_data_augmentation"]:
-                # Augmentation using symmetry
-                data_augmentation_func = self.symmetry["data_augmentation_func"]
-                # Returned shape: [batch_size * num_aug, ...]
-                obs_batch, actions_batch = data_augmentation_func(
-                    obs=obs_batch,
-                    actions=actions_batch,
-                    env=self.symmetry["_env"],
-                )
-                # Compute number of augmentations per sample
-                num_aug = int(obs_batch.batch_size[0] / original_batch_size)
-                # Repeat the rest of the batch
-                returns_batch = returns_batch.repeat(num_aug, 1)
+            # Build minibatch dict
+            minibatch = {
+                "obs_batch": obs_batch,
+                "actions_batch": actions_batch,
+                "returns_batch": returns_batch,
+                "truncations_batch": truncations_batch,
+                "hidden_states_batch": hidden_states_batch,
+                "masks_batch": masks_batch,
+                "old_mean": old_mean_batch,
+                "old_std": old_std_batch,
+            }
 
-            # get current actor critic outputs
-            self.policy.act(obs_batch, hidden_states_batch, masks_batch)
-            predicted_policy = self.policy.distribution
-            predicted_actions = predicted_policy.rsample()
-            value_prediction, value_logits = self.policy.evaluate(
-                obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
-            )
-            on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
+            # Update critic
+            critic_metrics = self.update_critic(minibatch)
 
-            # VALUE LOSS
-            # embed the returns
-            embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
+        if self.policy.is_recurrent:
+            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        else:
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-            # compute loss
-            value_loss = -(
-                (1.0 - truncations_batch.view(-1))
-                * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
-            ).mean()
+        # Iterate over batches
+        for i, (
+            obs_batch,
+            actions_batch,
+            _,
+            _,
+            returns_batch,
+            truncations_batch,
+            _,
+            old_mean_batch,
+            old_std_batch,
+            hidden_states_batch,
+            masks_batch,
+        ) in enumerate(generator):
 
-            # POLICY LOSS
-            # temperature component
-            entropy = -predicted_policy.log_prob(predicted_actions).sum(-1)
-            entropy_loss = self.policy.alpha_temp.detach() * entropy
-            primary_policy_loss = -(on_policy_values + entropy_loss)
-
-            # KL computation
-            self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
-            old_policy_distribution = self.old_policy.distribution
-            old_policy_actions = old_policy_distribution.sample((16,))
-            log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
-            log_prob_new = predicted_policy.log_prob(old_policy_actions)
-            kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
-
-            # Clipped Policy Loss
-            policy_loss = torch.where(
-                (kl_divergence < self.desired_kl).detach(),
-                primary_policy_loss,
-                self.policy.alpha_kl.detach() * kl_divergence,
-            ).mean()
-
-            # temperature updates TODO: double check signs carefully!!!
-            temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
-            kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
-
-            # FULL LOSS
-            # Compute the gradients in two passes:
-            # 1. Value loss backward (updates critic)
-            # 2. Policy loss backward with frozen critic (only updates actor)
-
-            # Symmetry loss
-            if self.symmetry:
-                raise NotImplementedError("Symmetry loss not implemented yet.")
-            if self.rnd:
-                raise NotImplementedError("RND loss not implemented yet.")
-
-            # Compute the gradients
-            self.optimizer.zero_grad()
-
-            # First pass: value loss (updates critic parameters)
-            value_loss.backward(retain_graph=True)
-
-            # Second pass: policy loss with frozen critic
-            # Freeze critic parameters to prevent policy loss from updating them
-
-            self._set_critic_grad(False)
-            actor_loss = policy_loss + temp_target_loss + kl_target_loss
-            actor_loss.backward()
-
-            # Unfreeze critic parameters
-            self._set_critic_grad(True)
-
-            # Compute the gradients for RND
-            if self.rnd:
-                self.rnd_optimizer.zero_grad()
-                rnd_loss.backward()
-
-            # Collect gradients from all GPUs
-            if self.is_multi_gpu:
-                self.reduce_parameters()
-
-            # Apply the gradients for PPO
-            grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            # Apply the gradients for RND
-            if self.rnd_optimizer:
-                self.rnd_optimizer.step()
+            # Build minibatch dict
+            minibatch = {
+                "obs_batch": obs_batch,
+                "actions_batch": actions_batch,
+                "returns_batch": returns_batch,
+                "truncations_batch": truncations_batch,
+                "hidden_states_batch": hidden_states_batch,
+                "masks_batch": masks_batch,
+                "old_mean": old_mean_batch,
+                "old_std": old_std_batch,
+            }
+            
+            # Update actor
+            actor_metrics = self.update_actor(minibatch)
 
             # Store the losses
-            mean_value_loss += value_loss.item()
-            mean_entropy += entropy.mean().item()
-            mean_surrogate_loss += actor_loss.item()
-        print("value prediction error: ", (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item())
+            mean_value_loss += critic_metrics["value_loss"]
+            mean_entropy += actor_metrics["entropy"]
+            mean_surrogate_loss += actor_metrics["actor_loss"]
 
-        decoded_returns = self.policy.hlgauss_decode(torch.log(embedded_returns)).detach()
-        print("enc dec error: ", (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item())
-        print("on policy values mean: ", on_policy_values.mean().item())
-        print("entropy: ", entropy.mean().item())
-        print("kl divergence: ", kl_divergence.mean().item())
+        print("value prediction error: ", critic_metrics["value_prediction_error"])
+        print("enc dec error: ", critic_metrics["enc_dec_error"])
+        print("on policy values mean: ", actor_metrics["on_policy_values_mean"])
+        print("entropy: ", actor_metrics["entropy"])
+        print("kl divergence: ", actor_metrics["kl_divergence"])
         print("entropy target: ", self.target_entropy)
         print("alpha temp: ", self.policy.alpha_temp.item())
         print("alpha kl: ", self.policy.alpha_kl.item())
@@ -363,6 +308,133 @@ class REPPO:
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
         return loss_dict
+    
+    def update_actor(self, minibatch: dict) -> dict:
+        """Update the actor network.
+        
+        Args:
+            minibatch: Dictionary containing the minibatch data with keys:
+                - obs_batch: Observations
+                - actions_batch: Actions
+                - returns_batch: Returns
+                - truncations_batch: Truncation flags
+                - hidden_states_batch: Hidden states (for recurrent policies)
+                - masks_batch: Masks (for recurrent policies)
+        
+        Returns:
+            Dictionary containing actor metrics.
+        """
+        obs_batch = minibatch["obs_batch"]
+        hidden_states_batch = minibatch["hidden_states_batch"]
+        masks_batch = minibatch["masks_batch"]
+
+        # Get current actor outputs
+        self.policy.act(obs_batch, hidden_states_batch, masks_batch)
+        predicted_policy = self.policy.distribution
+        predicted_actions = predicted_policy.rsample()
+        on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
+
+        # Temperature component
+        entropy = -predicted_policy.log_prob(predicted_actions).sum(-1)
+        entropy_loss = self.policy.alpha_temp.detach() * entropy
+        primary_policy_loss = -(on_policy_values + entropy_loss)
+
+        # KL computation
+        self.old_policy._update_distribution(obs_batch, minibatch["old_mean"], minibatch["old_std"])
+        old_policy_distribution = self.old_policy.distribution
+        old_policy_actions = old_policy_distribution.sample((1,))
+        log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
+        log_prob_new = predicted_policy.log_prob(old_policy_actions)
+        kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
+
+        # Clipped Policy Loss
+        policy_loss = torch.where(
+            (kl_divergence < self.desired_kl).detach(),
+            primary_policy_loss,
+            self.policy.alpha_kl.detach() * kl_divergence,
+        ).mean()
+
+        # Temperature updates
+        temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
+        kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
+
+        # Freeze critic parameters to prevent policy loss from updating them
+        self._set_critic_grad(False)
+        self.optimizer.zero_grad()
+        actor_loss = policy_loss + temp_target_loss + kl_target_loss
+        actor_loss.backward()
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+
+        # Unfreeze critic parameters
+        self._set_critic_grad(True)
+
+        return {
+            "actor_loss": actor_loss.item(),
+            "entropy": entropy.mean().item(),
+            "kl_divergence": kl_divergence.mean().item(),
+            "on_policy_values_mean": on_policy_values.mean().item(),
+        }
+
+    def update_critic(self, minibatch: dict) -> dict:
+        """Update the critic network.
+        
+        Args:
+            minibatch: Dictionary containing the minibatch data with keys:
+                - obs_batch: Observations
+                - actions_batch: Actions
+                - returns_batch: Returns
+                - truncations_batch: Truncation flags
+                - hidden_states_batch: Hidden states (for recurrent policies)
+                - masks_batch: Masks (for recurrent policies)
+        
+        Returns:
+            Dictionary containing critic metrics.
+        """
+        obs_batch = minibatch["obs_batch"]
+        actions_batch = minibatch["actions_batch"]
+        returns_batch = minibatch["returns_batch"]
+        truncations_batch = minibatch["truncations_batch"]
+        hidden_states_batch = minibatch["hidden_states_batch"]
+        masks_batch = minibatch["masks_batch"]
+
+        # Get current critic outputs
+        value_prediction, value_logits = self.policy.evaluate(
+            obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
+        )
+
+        # VALUE LOSS
+        # Embed the returns
+        embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
+
+        # Compute loss
+        value_loss = -(
+            (1.0 - truncations_batch.view(-1))
+            * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
+        ).mean()
+
+        # Compute the gradients
+        self.optimizer.zero_grad()
+        value_loss.backward()
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+
+        # Compute metrics for logging
+        value_prediction_error = (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item()
+        decoded_returns = self.policy.hlgauss_decode(torch.log(embedded_returns)).detach()
+        enc_dec_error = (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item()
+
+        return {
+            "value_loss": value_loss.item(),
+            "value_prediction_error": value_prediction_error,
+            "enc_dec_error": enc_dec_error,
+        }
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""

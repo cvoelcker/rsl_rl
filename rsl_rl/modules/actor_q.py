@@ -29,14 +29,14 @@ class ActorQ(nn.Module):
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
         critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
-        num_critic_bins: int = 201,
+        num_critic_bins: int = 151,
         vmin: float = -10.0,
         vmax: float = 10.0,
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
-        state_dependent_std: bool = False,
-        distribution_type: str = "normal",
+        state_dependent_std: bool = True,
+        distribution_type: str = "tanh",
         init_alpha_temp: float = 0.1,
         init_alpha_kl: float = 0.1,
         **kwargs: dict[str, Any],
@@ -116,25 +116,26 @@ class ActorQ(nn.Module):
         # Action noise
         self.noise_std_type = noise_std_type
         if self.state_dependent_std:
-            pass
-        #     torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
-        #     if self.noise_std_type == "scalar":
-        #         torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
-        #     elif self.noise_std_type == "log":
-        #         torch.nn.init.constant_(
-        #             self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
-        #         )
-        #     elif self.noise_std_type == "sigmoid":
-        #         torch.nn.init.constant_(
-        #             self.actor[-2].bias[num_actions:], -torch.log(torch.tensor((1.0 / init_noise_std) - 1.0) + 1e-7)
-        #         )
-        #     else:
-        #         raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
+            if self.noise_std_type == "scalar":
+                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
+            elif self.noise_std_type == "log":
+                torch.nn.init.constant_(
+                    self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
+                )
+            elif self.noise_std_type == "sigmoid":
+                torch.nn.init.constant_(
+                    self.actor[-2].bias[num_actions:], -torch.log(torch.tensor((1.0 / init_noise_std) - 1.0) + 1e-7)
+                )
+            else:
+                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:
             if self.noise_std_type == "scalar":
                 self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
             elif self.noise_std_type == "log":
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            elif self.noise_std_type == "sigmoid": 
+                self.log_std = nn.Parameter(torch.logit((init_noise_std - 1e-4) * torch.ones(num_actions)))
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
@@ -190,30 +191,32 @@ class ActorQ(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _update_distribution(self, obs: torch.Tensor) -> None:
-        if self.state_dependent_std:
-            # Compute mean and standard deviation
-            mean_and_std = self.actor(obs)
-            if self.noise_std_type == "scalar":
-                mean, std = torch.unbind(mean_and_std, dim=-2)
-            elif self.noise_std_type == "log":
-                mean, log_std = torch.unbind(mean_and_std, dim=-2)
-                std = torch.exp(log_std) + 1e-4
-            elif self.noise_std_type == "sigmoid":
-                mean, logit_std = torch.unbind(mean_and_std, dim=-2)
-                std = torch.sigmoid(logit_std) + 1e-4
+    def _update_distribution(self, obs: torch.Tensor, mean=None, std=None) -> None:
+        if mean is None or std is None:
+            if self.state_dependent_std:
+                # Compute mean and standard deviation
+                mean_and_std = self.actor(obs)
+                if self.noise_std_type == "scalar":
+                    mean, std = torch.unbind(mean_and_std, dim=-2)
+                elif self.noise_std_type == "log":
+                    mean, log_std = torch.unbind(mean_and_std, dim=-2)
+                    log_std = torch.clamp(log_std, min=-5.0, max=2.0)
+                    std = torch.exp(log_std)
+                elif self.noise_std_type == "sigmoid":
+                    mean, logit_std = torch.unbind(mean_and_std, dim=-2)
+                    std = torch.sigmoid(logit_std) + 1e-4
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
             else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        else:
-            # Compute mean
-            mean = self.actor(obs)
-            # Compute standard deviation
-            if self.noise_std_type == "scalar":
-                std = self.std.expand_as(mean)
-            elif self.noise_std_type == "log":
-                std = torch.exp(self.log_std).expand_as(mean)
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+                # Compute mean
+                mean = self.actor(obs)
+                # Compute standard deviation
+                if self.noise_std_type == "scalar":
+                    std = self.std.expand_as(mean)
+                elif self.noise_std_type == "log":
+                    std = torch.exp(self.log_std).expand_as(mean)
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # Create distribution
         if self.distribution_type == "normal":
             self.distribution = Normal(mean, std)
