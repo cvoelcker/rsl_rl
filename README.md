@@ -1,4 +1,8 @@
-# RSL-RL
+# RSL-RL ❤️ REPPO
+
+Contains a robotics friendly implementation for the [REPPO algorithm](https://cvoelcker.de/projects/reppo/)
+
+---
 
 A fast and simple implementation of learning algorithms for robotics. For an overview of the library please have a look at https://arxiv.org/pdf/2509.10771.
 
