@@ -1,0 +1,50 @@
+# Minimal PPO runner preset intended for Isaac Lab via skrl wrapper.
+# Observations default to a single flat group: "policy" (and critic uses the same).
+class_name: OnPolicyRunner
+
+num_steps_per_env: 24
+max_iterations: 1500
+seed: 1
+
+obs_groups: {policy: [policy], critic: [policy]}
+
+save_interval: 50
+experiment_name: isaaclab_experiment
+run_name: ""
+logger: tensorboard
+neptune_project: isaaclab
+wandb_project: isaaclab
+
+policy:
+  class_name: ActorCritic
+  activation: elu
+  actor_obs_normalization: false
+  critic_obs_normalization: false
+  actor_hidden_dims: [256, 256, 256]
+  critic_hidden_dims: [256, 256, 256]
+  init_noise_std: 1.0
+  noise_std_type: scalar
+  state_dependent_std: false
+
+algorithm:
+  class_name: PPO
+  learning_rate: 0.001
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  schedule: adaptive
+  value_loss_coef: 1.0
+  clip_param: 0.2
+  use_clipped_value_loss: true
+  desired_kl: 0.01
+  entropy_coef: 0.01
+  gamma: 0.99
+  lam: 0.95
+  max_grad_norm: 1.0
+  normalize_advantage_per_mini_batch: false
+
+  scale_actions: false
+  action_upper_bound: 1.0
+  action_lower_bound: -1.0
+
+  rnd_cfg: null
+  symmetry_cfg: null

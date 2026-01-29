@@ -1,0 +1,43 @@
+defaults:
+  - runner: reppo
+  - _self_
+
+# Device used by the runner/algorithm.
+# For multi-GPU (torchrun), `train_isaac.py` will auto-map this to `cuda:${env:LOCAL_RANK,0}`.
+device: cuda:0
+
+# Where to write logs/checkpoints (Tensorboard/W&B/Neptune). If null, logging is disabled.
+log_dir: runs/${runner.experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+
+# Optional checkpoint to resume from.
+resume: null
+load_optimizer: true
+
+# Optional: export a trained policy from `resume`.
+# Use `python -m rsl_rl.export_isaac_policy ...` (requires env construction, typically inside Isaac Sim container)
+# or `python -m rsl_rl.export_policy_checkpoint ...` (container-free; exports state_dict only).
+export_path: null
+export_jit: false
+export_jit_path: null
+export_map_location: null
+
+# If null, defaults to `runner.max_iterations`.
+num_learning_iterations: null
+init_at_random_ep_len: false
+
+# Environment factory.
+# Provide a callable string in the form `module:attribute`, returning a `rsl_rl.env.VecEnv`.
+# Example (external repo): env.make: legged_gym.utils.task_registry:make_env
+env:
+  make: rsl_rl.train_isaac:make_isaaclab_vec_env
+  kwargs:
+    task_name: Isaac-Velocity-Rough-H1-v0
+    num_envs: 2048
+    headless: true
+    show_cfg: true
+    wrapper: isaaclab
+    verbose: true
+
+hydra:
+  job:
+    chdir: true

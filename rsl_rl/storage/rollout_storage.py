@@ -12,6 +12,27 @@ from tensordict import TensorDict
 from rsl_rl.networks import HiddenState
 from rsl_rl.utils import split_and_pad_trajectories
 
+class Transition:
+
+
+    """Storage for a single state transition."""
+
+    def __init__(self) -> None:
+        self.observations: TensorDict | None = None
+        self.actions: torch.Tensor | None = None
+        self.privileged_actions: torch.Tensor | None = None
+        self.rewards: torch.Tensor | None = None
+        self.soft_rewards: torch.Tensor | None = None
+        self.dones: torch.Tensor | None = None
+        self.truncations: torch.Tensor | None = None
+        self.values: torch.Tensor | None = None
+        self.actions_log_prob: torch.Tensor
+        self.action_mean: torch.Tensor | None = None
+        self.action_sigma: torch.Tensor | None = None
+        self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+
+    def clear(self) -> None:
+        self.__init__()
 
 class RolloutStorage:
     """Storage for the data collected during a rollout.
@@ -19,27 +40,6 @@ class RolloutStorage:
     The rollout storage is populated by adding transitions during the rollout phase. It then returns a generator for
     learning, depending on the algorithm and the policy architecture.
     """
-
-    class Transition:
-        """Storage for a single state transition."""
-
-        def __init__(self) -> None:
-            self.observations: TensorDict | None = None
-            self.actions: torch.Tensor | None = None
-            self.privileged_actions: torch.Tensor | None = None
-            self.rewards: torch.Tensor | None = None
-            self.soft_rewards: torch.Tensor | None = None
-            self.dones: torch.Tensor | None = None
-            self.truncations: torch.Tensor | None = None
-            self.values: torch.Tensor | None = None
-            self.actions_log_prob: torch.Tensor
-            self.action_mean: torch.Tensor | None = None
-            self.action_sigma: torch.Tensor | None = None
-            self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
-
-        def clear(self) -> None:
-            self.__init__()
-
     def __init__(
         self,
         training_type: str,
@@ -284,3 +284,16 @@ class RolloutStorage:
         for i in range(len(hidden_state_a)):
             self.saved_hidden_state_a[i][self.step].copy_(hidden_state_a[i])
             self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])
+
+
+class HybridStorage:
+    """Stoarge for hybrid on-policy off-policy replay buffers.
+    """
+
+    def __init__(self,
+        num_envs: int,
+        num_transitions_per_env: int,
+        obs: TensorDict,
+        actions_shape: tuple[int] | list[int],
+        device: str = "cpu",) -> None:
+        pass

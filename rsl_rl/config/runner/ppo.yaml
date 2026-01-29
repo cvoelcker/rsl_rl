@@ -1,0 +1,49 @@
+# Mirrors `config/example_config.yaml` but scoped to `runner.*` for Hydra.
+class_name: OnPolicyRunner
+
+# General
+num_steps_per_env: 64
+max_iterations: 1500
+seed: 1
+
+# Observations
+obs_groups: {policy: [policy], critic: [critic]}
+
+# Logging
+save_interval: 50
+experiment_name: walking_experiment
+run_name: ""
+logger: wandb  # tensorboard, neptune, wandb
+neptune_project: legged_gym
+wandb_project: legged_gym
+
+policy:
+  class_name: ActorCritic
+  activation: elu
+  actor_obs_normalization: false
+  critic_obs_normalization: false
+  actor_hidden_dims: [256, 256, 256]
+  critic_hidden_dims: [256, 256, 256]
+  init_noise_std: 1.0
+  noise_std_type: scalar  # scalar or log
+  state_dependent_std: false
+
+algorithm:
+  class_name: PPO
+  learning_rate: 0.001
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  schedule: adaptive
+  value_loss_coef: 1.0
+  clip_param: 0.2
+  use_clipped_value_loss: true
+  desired_kl: 0.01
+  entropy_coef: 0.01
+  gamma: 0.99
+  lam: 0.95
+  max_grad_norm: 1.0
+  normalize_advantage_per_mini_batch: false
+
+  # Optional RND / symmetry (must exist as keys; use null to disable)
+  rnd_cfg: null
+  symmetry_cfg: null

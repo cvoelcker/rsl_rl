@@ -51,6 +51,25 @@ The package supports the following logging frameworks which can be configured th
 
 For a demo configuration of PPO, please check the [example_config.yaml](config/example_config.yaml) file.
 
+## Export a trained policy
+
+- Container-free (extract policy weights only):
+
+```bash
+python -m rsl_rl.export_policy_checkpoint --checkpoint /abs/path/to/model_1000.pt --out /abs/path/to/policy.pt
+```
+
+- With env available (optional TorchScript export; constructs env):
+
+```bash
+python -m rsl_rl.export_isaac_policy \
+  resume=/abs/path/to/model_1000.pt \
+  export_path=/abs/path/to/policy.pt \
+  export_jit=true \
+  export_jit_path=/abs/path/to/policy_jit.pt \
+  export_map_location=cpu
+```
+
 
 ## Contribution Guidelines
 

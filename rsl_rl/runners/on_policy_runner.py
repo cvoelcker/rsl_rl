@@ -26,6 +26,7 @@ from rsl_rl.modules import (
 )
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_obs_groups
+from rsl_rl.utils.policy_export import export_policy_as_torchscript, save_policy_checkpoint
 from rsl_rl.utils.logger import Logger
 
 
@@ -98,6 +99,9 @@ class OnPolicyRunner:
                     # Step the environment
                     # print("mean abs actions: ", actions.abs().mean())  # DEBUG
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    rewards = rewards.squeeze(-1)
+                    dones = dones.squeeze(-1)
+                    extras["time_outs"] = extras["time_outs"].squeeze(-1)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
@@ -159,6 +163,30 @@ class OnPolicyRunner:
 
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
+
+    def save_policy(self, path: str, infos: dict | None = None) -> None:
+        """Save a minimal checkpoint containing only the trained policy (for inference)."""
+
+        metadata = {
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+            "obs_groups": self.cfg.get("obs_groups"),
+            "num_actions": getattr(self.env, "num_actions", None),
+            "policy_class": type(self.alg.policy).__name__,
+            "policy_module": type(self.alg.policy).__module__,
+        }
+        save_policy_checkpoint(path, model_state_dict=self.alg.policy.state_dict(), metadata=metadata)
+        self.logger.save_model(path, self.current_learning_iteration)
+
+    def export_policy_jit(self, path: str, *, device: str = "cpu") -> None:
+        """Export the policy as a TorchScript module (flat actor obs -> actions).
+
+        See `rsl_rl.utils.policy_export.export_policy_as_torchscript` for current limitations.
+        """
+
+        self.eval_mode()
+        obs = self.env.get_observations().to(self.device)
+        export_policy_as_torchscript(self.alg.policy, example_obs=obs, out_path=path, device=device)
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)

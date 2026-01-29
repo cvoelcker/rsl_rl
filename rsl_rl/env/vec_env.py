@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Iterable
+
 import torch
 from abc import ABC, abstractmethod
 from tensordict import TensorDict
@@ -89,3 +92,114 @@ class VecEnv(ABC):
                tensor. If it is a tensor, the mean of the tensor is used for logging.
         """
         raise NotImplementedError
+
+
+def _prod(values: Iterable[int]) -> int:
+    out = 1
+    for v in values:
+        out *= int(v)
+    return int(out)
+
+
+def _space_num_actions(space: Any) -> int:
+    # gymnasium.spaces.Box
+    if hasattr(space, "shape") and space.shape is not None:
+        return _prod(space.shape)
+    # gymnasium.spaces.Discrete
+    if hasattr(space, "n"):
+        return 1
+    raise TypeError(f"Unsupported action space type: {type(space)}")
+
+
+@dataclass
+class _UnwrappedFallback:
+    step_dt: float = 1.0
+
+
+class SkrlIsaacLabVecEnv(VecEnv):
+    """Adapter from skrl's Isaac Lab wrapper API to rsl_rl's `VecEnv` API.
+
+    rsl_rl expects:
+    - `get_observations()` returning a `tensordict.TensorDict` with named observation groups.
+    - `step()` returning `(obs: TensorDict, rewards: Tensor, dones: Tensor, extras: dict)`.
+
+    skrl wrappers expose a gym-like API:
+    - `reset() -> (obs, info)`
+    - `step(actions) -> (obs, reward, terminated, truncated, info)`
+    """
+
+    def __init__(self, env: Any):
+        self._env = env
+
+        self.num_envs = int(getattr(env, "num_envs", 1))
+        self.device = getattr(env, "device", "cuda" if torch.cuda.is_available() else "cpu")
+        self.cfg = getattr(env, "cfg", {})
+        self.unwrapped = getattr(env, "unwrapped", _UnwrappedFallback())
+
+        self.num_actions = _space_num_actions(getattr(env, "action_space"))
+
+        max_ep = getattr(env, "max_episode_length", None)
+        if max_ep is None:
+            max_ep = getattr(env, "max_episode_steps", None)
+        if max_ep is None:
+            max_ep = 1
+        self.max_episode_length = max_ep
+        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+
+        obs, _info = env.reset()
+        self._obs = obs
+
+    def _to_obs_tensordict(self, obs: Any) -> TensorDict:
+        if isinstance(obs, TensorDict):
+            return obs
+
+        if isinstance(obs, dict):
+            out: dict[str, torch.Tensor] = {}
+            for k, v in obs.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                out[str(k)] = v
+            if not out:
+                raise TypeError("Observation dict contained no torch.Tensors")
+            batch_size = [next(iter(out.values())).shape[0]]
+            return TensorDict(out, batch_size=batch_size, device=next(iter(out.values())).device)
+
+        if isinstance(obs, torch.Tensor):
+            batch_size = [obs.shape[0]] if obs.ndim >= 1 else [1]
+            return TensorDict({"policy": obs, "critic": obs}, batch_size=batch_size, device=obs.device)
+
+        raise TypeError(f"Unsupported observation type from env: {type(obs)}")
+
+    def get_observations(self) -> TensorDict:
+        return self._to_obs_tensordict(self._obs)
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        obs, rewards, terminated, truncated, info = self._env.step(actions)
+
+        if not isinstance(rewards, torch.Tensor):
+            rewards = torch.as_tensor(rewards, device=self.device)
+        if not isinstance(terminated, torch.Tensor):
+            terminated = torch.as_tensor(terminated, device=self.device)
+        if not isinstance(truncated, torch.Tensor):
+            truncated = torch.as_tensor(truncated, device=self.device)
+
+        dones = (terminated | truncated).to(torch.int32)
+
+        self.episode_length_buf += 1
+        done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
+        if done_ids.numel() > 0:
+            self.episode_length_buf[done_ids] = 0
+
+        self._obs = obs
+
+        extras: dict[str, Any] = {}
+        if isinstance(info, dict):
+            if isinstance(info.get("log"), dict):
+                extras["log"] = info["log"]
+            if isinstance(info.get("episode"), dict):
+                extras["episode"] = info["episode"]
+            extras["info"] = info
+
+        extras["time_outs"] = truncated
+
+        return self._to_obs_tensordict(obs), rewards, dones, extras

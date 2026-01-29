@@ -14,8 +14,9 @@ from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent
+from rsl_rl.modules import ActorQ, ActorQCNN, ActorQRecurrent
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import RolloutStorage, Transition
 from rsl_rl.utils import string_to_callable
 
 
@@ -109,7 +110,7 @@ class REPPO:
 
         # Add storage
         self.storage = storage
-        self.transition = RolloutStorage.Transition()
+        self.transition = Transition()
 
         # REPPO parameters
         self.num_learning_epochs = num_learning_epochs
@@ -158,7 +159,6 @@ class REPPO:
         # Bootstrapping on time outs
         if "time_outs" in extras:
             self.transition.rewards += self.gamma * self.transition.values * extras["time_outs"].to(self.device)
-
         self.transition.soft_rewards = (
             self.transition.rewards - self.gamma * self.policy.alpha_temp * self.transition.actions_log_prob
         )
