@@ -1,3 +1,5 @@
+[2026/01/30] 🚨🚨🚨 We found two major bugs in the implementation which are currently being fixed 🚨🚨🚨
+
 # RSL-RL ❤️ REPPO
 
 Contains a robotics friendly implementation for the [REPPO algorithm](https://cvoelcker.de/projects/reppo/)
