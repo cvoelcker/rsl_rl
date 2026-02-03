@@ -12,9 +12,9 @@ from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any, NoReturn
 
-from rsl_rl.networks import MLP, EmpiricalNormalization
+from rsl_rl.networks import MLP, EmpiricalNormalization, TanhNormal
+from rsl_rl.networks.sem import SimplicalEmbeddingModule
 from rsl_rl.utils.hl_gauss import HLGaussLayer, embed_targets
-from rsl_rl.networks import TanhNormal
 
 
 class ActorQ(nn.Module):
@@ -34,11 +34,14 @@ class ActorQ(nn.Module):
         vmax: float = 10.0,
         activation: str = "elu",
         init_noise_std: float = 1.0,
+        min_noise_std: float = 0.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = True,
         distribution_type: str = "tanh",
         init_alpha_temp: float = 0.1,
         init_alpha_kl: float = 0.1,
+        add_sem: bool = False,
+        add_layer_norm: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -58,25 +61,12 @@ class ActorQ(nn.Module):
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
-        # save activation
-        self.activation = activation
-        if self.activation == "selu":
-            self.activation_fn = F.selu
-        elif self.activation == "relu":
-            self.activation_fn = F.relu
-        elif self.activation == "elu":
-            self.activation_fn = F.elu
-        elif self.activation == "swish":
-            self.activation_fn = F.silu
-        else:
-            raise ValueError(f"Unknown activation function: {self.activation}")
-
         # Actor
         self.state_dependent_std = state_dependent_std
         if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation, add_sem=add_sem, use_layer_norm=add_layer_norm)
         else:
-            self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
+            self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation, add_sem=add_sem, use_layer_norm=add_layer_norm)
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization
@@ -95,7 +85,21 @@ class ActorQ(nn.Module):
         self.num_critic_bins = num_critic_bins
         self.vmin = vmin
         self.vmax = vmax
-        self.critic = MLP(num_critic_obs, critic_hidden_dims[-1], critic_hidden_dims[:-1], activation)
+        self.critic = MLP(num_critic_obs, critic_hidden_dims[-1], critic_hidden_dims[:-1], activation, last_activation=activation, add_sem=False, use_layer_norm=add_layer_norm)
+        match (add_sem, add_layer_norm):
+            case (True, False):
+                self.critic_embedding_norm = nn.Sequential(
+                    SimplicalEmbeddingModule(embed_dim=critic_hidden_dims[-1], chunk_size=16)
+                )
+            case (False, True):
+                self.critic_embedding_norm = nn.Sequential(
+                    nn.LayerNorm(critic_hidden_dims[-1])
+                )
+            case (False, False):
+                self.critic_embedding_norm = nn.Identity()
+            case (True, True):
+                raise ValueError("Cannot use both SEM and LayerNorm in the critic.")
+
         self.critic_embedding_layer = HLGaussLayer(
             in_features=critic_hidden_dims[-1],
             min_value=vmin,
@@ -134,7 +138,7 @@ class ActorQ(nn.Module):
                 self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
             elif self.noise_std_type == "log":
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-            elif self.noise_std_type == "sigmoid": 
+            elif self.noise_std_type == "sigmoid":
                 self.log_std = nn.Parameter(torch.logit((init_noise_std - 1e-4) * torch.ones(num_actions)))
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
@@ -150,6 +154,8 @@ class ActorQ(nn.Module):
 
         # set magic 0 embedding
         self.norm = nn.LayerNorm(critic_hidden_dims[-1])
+
+        self.min_noise_std = min_noise_std
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -181,6 +187,10 @@ class ActorQ(nn.Module):
 
     @property
     def action_mean(self) -> torch.Tensor:
+        # Return the pre-tanh mean (loc) for TanhNormal, not the squashed mean
+        # This is needed for correct distribution reconstruction
+        if hasattr(self.distribution, "loc"):
+            return self.distribution.loc
         return self.distribution.mean
 
     @property
@@ -198,15 +208,17 @@ class ActorQ(nn.Module):
                 mean_and_std = self.actor(obs)
                 if self.noise_std_type == "scalar":
                     mean, std = torch.unbind(mean_and_std, dim=-2)
+                    std = torch.nn.functional.softplus(std)
                 elif self.noise_std_type == "log":
                     mean, log_std = torch.unbind(mean_and_std, dim=-2)
-                    log_std = torch.clamp(log_std, min=-5.0, max=2.0)
                     std = torch.exp(log_std)
                 elif self.noise_std_type == "sigmoid":
                     mean, logit_std = torch.unbind(mean_and_std, dim=-2)
-                    std = torch.sigmoid(logit_std) + 1e-4
+                    std = torch.sigmoid(logit_std)
                 else:
-                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+                    raise ValueError(
+                        f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
+                    )
             else:
                 # Compute mean
                 mean = self.actor(obs)
@@ -215,8 +227,15 @@ class ActorQ(nn.Module):
                     std = self.std.expand_as(mean)
                 elif self.noise_std_type == "log":
                     std = torch.exp(self.log_std).expand_as(mean)
+                elif self.noise_std_type == "sigmoid":
+                    std = torch.sigmoid(self.log_std).expand_as(mean)
                 else:
-                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+                    raise ValueError(
+                        f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
+                    )
+            mean = mean
+            std = std + self.min_noise_std
+        
         # Create distribution
         if self.distribution_type == "normal":
             self.distribution = Normal(mean, std)
@@ -242,9 +261,8 @@ class ActorQ(nn.Module):
         obs = self.critic_obs_normalizer(obs)
         inp = torch.cat([obs, act], dim=-1)
         embeddings = self.critic(inp)
-        embeddings = self.activation_fn(embeddings)
-        embeddings = self.norm(embeddings)
-        return self.critic_embedding_layer(self.activation_fn(embeddings), return_logits=return_logits)
+        embeddings = self.critic_embedding_norm(embeddings)
+        return self.critic_embedding_layer(embeddings, return_logits=return_logits)
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]

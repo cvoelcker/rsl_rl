@@ -5,7 +5,6 @@ outputs to [-1, 1]. Commonly used in SAC and other algorithms requiring bounded 
 """
 
 import math
-
 import torch
 import torch.nn as nn
 from torch import Tensor

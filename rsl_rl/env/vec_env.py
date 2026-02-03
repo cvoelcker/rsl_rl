@@ -5,12 +5,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable
-
 import torch
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from dataclasses import dataclass
 from tensordict import TensorDict
+from typing import Any
 
 
 class VecEnv(ABC):
@@ -136,7 +136,7 @@ class SkrlIsaacLabVecEnv(VecEnv):
         self.cfg = getattr(env, "cfg", {})
         self.unwrapped = getattr(env, "unwrapped", _UnwrappedFallback())
 
-        self.num_actions = _space_num_actions(getattr(env, "action_space"))
+        self.num_actions = _space_num_actions(env.action_space)
 
         max_ep = getattr(env, "max_episode_length", None)
         if max_ep is None:

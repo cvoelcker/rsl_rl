@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import Any, cast
-
 import torch
 from tensordict import TensorDict
 from torch import nn
+from typing import Any, cast
 
 
 def save_policy_checkpoint(
@@ -19,7 +18,6 @@ def save_policy_checkpoint(
     The file format is compatible with `OnPolicyRunner.load`'s expectations in that it stores
     `model_state_dict`, but it intentionally omits optimizer / RND state.
     """
-
     out_dir = os.path.dirname(path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -37,7 +35,6 @@ def load_policy_checkpoint(path: str, *, map_location: str | None = None) -> tup
     Returns:
         (model_state_dict, metadata)
     """
-
     payload: dict[str, Any] = torch.load(path, weights_only=False, map_location=map_location)
 
     if "model_state_dict" not in payload:
@@ -94,7 +91,6 @@ def export_policy_as_torchscript(
 
     The exported module signature is: `actions = policy(actor_obs)`.
     """
-
     if bool(getattr(policy, "is_recurrent", False)):
         raise NotImplementedError("TorchScript export is not implemented for recurrent policies.")
 
@@ -114,8 +110,8 @@ def export_policy_as_torchscript(
             f"Got: {type(policy)}"
         )
 
-    actor: nn.Module = getattr(policy, "actor")
-    actor_obs_normalizer: nn.Module = getattr(policy, "actor_obs_normalizer")
+    actor: nn.Module = policy.actor
+    actor_obs_normalizer: nn.Module = policy.actor_obs_normalizer
     state_dependent_std: bool = bool(getattr(policy, "state_dependent_std", False))
 
     wrapper = FlatPolicy(

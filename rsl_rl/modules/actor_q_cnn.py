@@ -14,7 +14,7 @@ from torch.distributions import Normal
 from typing import Any
 
 from rsl_rl.networks import CNN, MLP, EmpiricalNormalization, TanhNormal
-from rsl_rl.utils.hl_gauss import HLGaussLayer, embed_targets
+from rsl_rl.utils.hl_gauss import HLGaussLayer
 
 from .actor_q import ActorQ
 

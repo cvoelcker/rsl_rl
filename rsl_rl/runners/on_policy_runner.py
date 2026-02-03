@@ -133,9 +133,6 @@ class OnPolicyRunner:
                 collect_time=collect_time,
                 learn_time=learn_time,
                 loss_dict=loss_dict,
-                learning_rate=self.alg.learning_rate,
-                action_std=self.alg.policy.action_std,
-                rnd_weight=self.alg.rnd.weight if self.alg_cfg["rnd_cfg"] else None,
             )
 
             # Save model
@@ -150,7 +147,7 @@ class OnPolicyRunner:
         # Save model
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            # "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }

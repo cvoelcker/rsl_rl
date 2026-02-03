@@ -92,6 +92,9 @@ class Logger:
 
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
+            # if len(new_ids) > 0:
+            #     print(f"terminated with lengths {self.cur_episode_length[new_ids][:, 0].mean()} and rewards {self.cur_reward_sum[new_ids][:, 0].mean()}, with current max length {self.cur_episode_length.max()} and max reward {self.cur_reward_sum.max()}")
+            #     print(f"Max reset length was {self.cur_episode_length[new_ids][:, 0].max()} and reward {self.cur_reward_sum[new_ids][:, 0].max()}")
             self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
             self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
             self.cur_reward_sum[new_ids] = 0
@@ -110,14 +113,29 @@ class Logger:
         collect_time: float,
         learn_time: float,
         loss_dict: dict,
-        learning_rate: float,
-        action_std: torch.Tensor,
-        rnd_weight: float | None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
     ) -> None:
-        """Log the training metrics to the logging service and print them to the console."""
+        """Log the training metrics to the logging service and print them to the console.
+        
+        Args:
+            it: Current iteration number.
+            start_it: Starting iteration number.
+            total_it: Total number of iterations.
+            collect_time: Time spent collecting data.
+            learn_time: Time spent learning.
+            loss_dict: Dictionary of metrics from the algorithm. Keys are metric names,
+                values are floats. Special prefixes are used for categorization:
+                - No prefix or "Loss/": logged under "Loss/" category
+                - "Policy/": logged under "Policy/" category  
+                - "Perf/": logged under "Perf/" category
+                - "Train/": logged under "Train/" category
+                - Any other "Category/metric" format is preserved as-is
+            print_minimal: Whether to print minimal output.
+            width: Width of the console output.
+            pad: Padding for console output alignment.
+        """
         if self.log_dir is not None and not self.disable_logs:
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
@@ -148,26 +166,36 @@ class Logger:
                         self.writer.add_scalar("Episode/" + key, value, it)
                         extras_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
 
-            # Log losses
+            # Log all metrics from loss_dict
+            # Separate into categories for organized logging
+            loss_metrics = {}
+            other_metrics = {}
             for key, value in loss_dict.items():
-                self.writer.add_scalar(f"Loss/{key}", value, it)
-            self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
-
-            # Log noise std
-            self.writer.add_scalar("Policy/mean_noise_std", action_std.mean().item(), it)
+                if value is None:
+                    continue
+                if "/" in key:
+                    # Already has a category prefix, log as-is
+                    self.writer.add_scalar(key, value, it)
+                    other_metrics[key] = value
+                else:
+                    # Default to Loss/ category
+                    self.writer.add_scalar(f"Loss/{key}", value, it)
+                    loss_metrics[key] = value
 
             # Log performance
             fps = int(collection_size / (collect_time + learn_time))
             self.writer.add_scalar("Perf/total_fps", fps, it)
             self.writer.add_scalar("Perf/collection_time", collect_time, it)
             self.writer.add_scalar("Perf/learning_time", learn_time, it)
+            self.writer.add_scalar("Perf/total_timesteps", self.tot_timesteps, it)
 
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
                 if self.cfg["algorithm"]["rnd_cfg"]:
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
-                    self.writer.add_scalar("Rnd/weight", rnd_weight, it)
+                    if "Rnd/weight" in loss_dict:
+                        pass  # Already logged above
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.logger_type != "wandb":
@@ -194,9 +222,13 @@ class Logger:
                 f"""{"Learning time:":>{pad}} {learn_time:.3f}s \n"""
             )
 
-            # Print losses
-            for key, value in loss_dict.items():
+            # Print loss metrics
+            for key, value in loss_metrics.items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+
+            # Print other metrics (with category prefix)
+            for key, value in other_metrics.items():
+                log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
@@ -205,9 +237,6 @@ class Logger:
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
-
-            # Print noise std
-            log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""
 
             # Print episode extras
             if not print_minimal:

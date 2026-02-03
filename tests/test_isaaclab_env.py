@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import os
+import torch
 from typing import Any
 
 import pytest
-import torch
 
 from rsl_rl.train_isaac import make_isaaclab_vec_env
 
 
 def _is_discrete_action_space(space: Any) -> bool:
-    return hasattr(space, "n") and isinstance(getattr(space, "n"), int)
+    return hasattr(space, "n") and isinstance(space.n, int)
 
 
 @pytest.mark.isaaclab

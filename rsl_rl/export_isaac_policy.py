@@ -39,10 +39,11 @@ def main(cfg: DictConfig) -> None:
           export_jit_path=/abs/path/to/policy_jit.pt \\
           export_map_location=cpu
     """
-
     resume = cfg.get("resume")
     if resume in (None, "null"):
-        raise ValueError("Missing `resume`. Provide the checkpoint to export from (e.g. resume=/path/to/model_1000.pt).")
+        raise ValueError(
+            "Missing `resume`. Provide the checkpoint to export from (e.g. resume=/path/to/model_1000.pt)."
+        )
 
     export_path = cfg.get("export_path")
     if export_path in (None, "null"):

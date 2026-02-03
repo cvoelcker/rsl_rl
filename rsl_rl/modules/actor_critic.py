@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from rsl_rl.networks.tanh_distribution import TanhNormal
 from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any, NoReturn
@@ -30,6 +31,7 @@ class ActorCritic(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        distribution_type: str = "normal",
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -98,6 +100,7 @@ class ActorCritic(nn.Module):
         # Action distribution
         # Note: Populated in update_distribution
         self.distribution = None
+        self.distribution_type = distribution_type
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -142,7 +145,10 @@ class ActorCritic(nn.Module):
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # Create distribution
-        self.distribution = Normal(mean, std)
+        if self.distribution_type == "normal":
+            self.distribution = Normal(mean, std)
+        elif self.distribution_type == "tanh":
+            self.distribution = TanhNormal(mean, std)
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)

@@ -3,7 +3,7 @@ class_name: OnPolicyRunner
 
 # General
 num_steps_per_env: 64
-max_iterations: 1500
+max_iterations: 2000
 seed: 1
 
 # Observations
@@ -11,8 +11,8 @@ obs_groups: {policy: [policy], critic: [critic]}
 
 # Logging
 save_interval: 50
-experiment_name: walking_experiment
-run_name: ""
+experiment_name: h1_rough
+run_name: ppo
 logger: wandb  # tensorboard, neptune, wandb
 neptune_project: legged_gym
 wandb_project: legged_gym
@@ -27,6 +27,7 @@ policy:
   init_noise_std: 1.0
   noise_std_type: scalar  # scalar or log
   state_dependent_std: false
+  distribution_type: tanh  # normal or ta
 
 algorithm:
   class_name: PPO
@@ -39,7 +40,7 @@ algorithm:
   use_clipped_value_loss: true
   desired_kl: 0.01
   entropy_coef: 0.01
-  gamma: 0.99
+  gamma: 0.97
   lam: 0.95
   max_grad_norm: 1.0
   normalize_advantage_per_mini_batch: false

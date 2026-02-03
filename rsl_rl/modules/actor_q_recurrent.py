@@ -176,6 +176,10 @@ class ActorQRecurrent(nn.Module):
 
     @property
     def action_mean(self) -> torch.Tensor:
+        # Return the pre-tanh mean (loc) for TanhNormal, not the squashed mean
+        # This is needed for correct distribution reconstruction
+        if hasattr(self.distribution, "loc"):
+            return self.distribution.loc
         return self.distribution.mean
 
     @property
@@ -201,7 +205,7 @@ class ActorQRecurrent(nn.Module):
                 mean, std = torch.unbind(mean_and_std, dim=-2)
             elif self.noise_std_type == "log":
                 mean, log_std = torch.unbind(mean_and_std, dim=-2)
-                std = torch.exp(log_std)
+                std = torch.exp(log_std) + 0.05
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:

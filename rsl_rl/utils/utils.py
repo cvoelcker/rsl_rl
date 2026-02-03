@@ -146,7 +146,8 @@ def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Ten
     """Do the inverse operation of `split_and_pad_trajectories()`."""
     # Need to transpose before and after the masking to have proper reshaping
     return (
-        trajectories.transpose(1, 0)[masks.transpose(1, 0)]
+        trajectories
+        .transpose(1, 0)[masks.transpose(1, 0)]
         .view(-1, trajectories.shape[0], trajectories.shape[-1])
         .transpose(1, 0)
     )

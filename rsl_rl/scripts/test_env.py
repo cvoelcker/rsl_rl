@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Any
-
 import torch
+from typing import Any
 
 from rsl_rl.train_isaac import make_isaaclab_vec_env
 
 
 def _is_discrete_action_space(space: Any) -> bool:
-    return hasattr(space, "n") and isinstance(getattr(space, "n"), int)
+    return hasattr(space, "n") and isinstance(space.n, int)
 
 
 def main(argv: list[str] | None = None) -> int:

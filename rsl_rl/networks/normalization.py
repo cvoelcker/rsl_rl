@@ -14,7 +14,7 @@ from torch import nn
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 
-    def __init__(self, shape: int | tuple[int] | list[int], eps: float = 1e-2, until: int | None = None) -> None:
+    def __init__(self, shape: int | tuple[int] | list[int], eps: float = 1e-1, until: int | None = None) -> None:
         """Initialize EmpiricalNormalization module.
 
         .. note:: The normalization parameters are computed over the whole batch, not for each environment separately.

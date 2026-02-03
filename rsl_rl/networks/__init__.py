@@ -9,15 +9,15 @@ from .cnn import CNN
 from .memory import HiddenState, Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
-from .tanh_distribution import log_prob_from_tanh_normal, TanhNormal
+from .tanh_distribution import TanhNormal, log_prob_from_tanh_normal
 
 __all__ = [
     "CNN",
+    "MLP",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
     "HiddenState",
-    "log_prob_from_tanh_normal",
     "Memory",
-    "MLP",
     "TanhNormal",
+    "log_prob_from_tanh_normal",
 ]

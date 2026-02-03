@@ -1,5 +1,5 @@
 defaults:
-  - runner: reppo
+  - runner: ppo
   - _self_
 
 # Device used by the runner/algorithm.
@@ -32,11 +32,11 @@ env:
   make: rsl_rl.train_isaac:make_isaaclab_vec_env
   kwargs:
     task_name: Isaac-Velocity-Rough-H1-v0
-    num_envs: 2048
+    num_envs: 4096
     headless: true
     show_cfg: true
     wrapper: isaaclab
-    verbose: true
+    verbose: false
 
 hydra:
   job:

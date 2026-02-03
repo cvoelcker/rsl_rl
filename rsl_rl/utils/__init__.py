@@ -5,7 +5,8 @@
 
 """Helper functions."""
 
-from .hl_gauss import embed_targets, HLGaussLayer, HLGaussTransform
+from .hl_gauss import HLGaussLayer, HLGaussTransform, embed_targets
+from .policy_export import export_policy_as_torchscript, load_policy_checkpoint, save_policy_checkpoint
 from .utils import (
     get_param,
     resolve_nn_activation,
@@ -15,14 +16,13 @@ from .utils import (
     string_to_callable,
     unpad_trajectories,
 )
-from .policy_export import export_policy_as_torchscript, load_policy_checkpoint, save_policy_checkpoint
 
 __all__ = [
+    "HLGaussLayer",
+    "HLGaussTransform",
     "embed_targets",
     "export_policy_as_torchscript",
     "get_param",
-    "HLGaussLayer",
-    "HLGaussTransform",
     "load_policy_checkpoint",
     "resolve_nn_activation",
     "resolve_obs_groups",

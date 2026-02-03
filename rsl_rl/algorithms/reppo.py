@@ -6,15 +6,13 @@
 from __future__ import annotations
 
 import copy
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent
-from rsl_rl.modules import ActorQ, ActorQCNN, ActorQRecurrent
+from rsl_rl.modules import ActorCriticRecurrent, ActorQ, ActorQCNN, ActorQRecurrent
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, Transition
 from rsl_rl.utils import string_to_callable
@@ -105,8 +103,19 @@ class REPPO:
         self.old_policy.to(self.device)
         self.old_policy.eval()
 
-        # Create the optimizer
-        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, weight_decay=1e-3, betas=(0.9, 0.95))
+        # Create separate optimizers for actor and critic
+        actor_params = list(self.policy.actor.parameters()) + [self.policy.log_alpha_temp, self.policy.log_alpha_kl]
+        if hasattr(self.policy, "std"):
+            actor_params.append(self.policy.std)
+        if hasattr(self.policy, "log_std"):
+            actor_params.append(self.policy.log_std)
+        critic_params = (
+            list(self.policy.critic.parameters())
+            + list(self.policy.critic_embedding_layer.parameters())
+            + list(self.policy.norm.parameters())
+        )
+        self.actor_optimizer = optim.Adam(actor_params, lr=learning_rate, betas=(0.9, 0.95))
+        self.critic_optimizer = optim.Adam(critic_params, lr=learning_rate, betas=(0.9, 0.95))
 
         # Add storage
         self.storage = storage
@@ -125,13 +134,11 @@ class REPPO:
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
-        # Compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs, self.transition.actions).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
-        # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions
 
@@ -144,24 +151,31 @@ class REPPO:
             self.rnd.update_normalization(obs)
 
         # Record the rewards and dones
-        # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
-        self.transition.truncations = extras["time_outs"].to(self.device) * 1.0
+        # Store truncations (time_outs) separately for proper handling in compute_returns
+        # Note: We do NOT bootstrap here because obs is post-reset and causally unrelated
+        # to the truncated transition. Truncation bootstrap is handled in compute_returns.
+        self.transition.truncations = extras.get("time_outs", torch.zeros_like(dones)).to(self.device)
 
-        # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            # Compute the intrinsic rewards
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
-            # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
-        # Bootstrapping on time outs
-        if "time_outs" in extras:
-            self.transition.rewards += self.gamma * self.transition.values * extras["time_outs"].to(self.device)
-        self.transition.soft_rewards = (
-            self.transition.rewards - self.gamma * self.policy.alpha_temp * self.transition.actions_log_prob
-        )
+        # compute entropy-regularized rewards
+        with torch.no_grad():
+            next_actions = self.policy.act(obs).detach()
+            next_actions_log_prob = (
+                self.policy.distribution.log_prob(next_actions.clamp(-1 + 1e-6, 1 - 1e-6)).sum(-1).detach()
+            )
+        self.transition.next_actions_log_prob = next_actions_log_prob
+
+        # For true terminals, don't add entropy bonus (there's no next state - obs is post-reset)
+        is_true_terminal = dones.bool() & ~self.transition.truncations.bool()
+        log_probs = self.gamma * self.policy.alpha_temp.detach() * next_actions_log_prob
+        entropy_bonus = -log_probs
+
+        self.transition.soft_rewards = self.transition.rewards + entropy_bonus
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -170,31 +184,83 @@ class REPPO:
 
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
-        # Compute value for the last step
         last_action = self.policy.act(obs).detach()
         last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
-        # Compute returns and advantages
-        recurr_value = last_values
+        recurr_value = 0.0
+
+        td_error = 0.0
+
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
-            # 1 if we are not in a terminal state, 0 otherwise
-            next_is_not_terminal = 1.0 - st.dones[step].float()
-            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-            delta_1 = next_is_not_terminal * self.gamma * next_values
-            delta_n = next_is_not_terminal * self.gamma * recurr_value
-            recurr_value = st.soft_rewards[step] + (1 - self.lam) * delta_1 + self.lam * delta_n
+
+            # Truncated transitions are masked from training. Set delta=0 to avoid polluting GAE.
+            # True terminals should zero out the bootstrap.
+            is_truncated = st.truncations[step].bool()
+            is_true_terminal = st.dones[step].bool() & ~is_truncated
+            next_is_not_terminal = 1.0 - is_true_terminal.float()
+
+            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t), zeroed for truncations
+            delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+            delta = torch.where(is_truncated, torch.zeros_like(delta), delta)
+
+            # Advantage propagation stops at ANY done (episode boundary)
+            next_is_not_done = 1.0 - st.dones[step].float()
+            # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
+            td_error = delta + next_is_not_done * self.gamma * self.lam * td_error
             # Return: R_t = A(s_t, a_t) + V(s_t)
-            st.returns[step] = recurr_value
+            st.returns[step] = td_error + st.values[step]
+            recurr_value = next_is_not_terminal * (recurr_value + self.gamma * st.rewards[step])
+            st.clean_returns[step] = recurr_value
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl_divergence = 0
+        mean_kl_exceed_frac = 0
+        mean_kl_std = 0
+        mean_kl_max = 0
+        mean_q_value_std = 0
+        mean_actor_grad_norm = 0
+        mean_critic_grad_norm = 0
+        mean_action_std_mean = 0
+        mean_action_std_min = 0
+        mean_action_std_max = 0
+        mean_action_mean_abs = 0
+        mean_primary_policy_loss = 0
+        mean_value_pred_error = 0
+        mean_value_pred_std = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+
+        # Compute return statistics before update (for diagnostics)
+        returns_mean = self.storage.returns.mean().item()
+        returns_std = self.storage.returns.std().item()
+        returns_min = self.storage.returns.min().item()
+        returns_max = self.storage.returns.max().item()
+
+        # Compute clean returns
+        clean_returns_mean = self.storage.clean_returns[0].mean().item()
+        clean_returns_std = self.storage.clean_returns[0].std().item()
+        clean_returns_min = self.storage.clean_returns[0].min().item()
+        clean_returns_max = self.storage.clean_returns[0].max().item()
+        
+        # Compute reward statistics
+        rewards_mean = self.storage.rewards.mean().item()
+        rewards_std = self.storage.rewards.std().item()
+        soft_rewards_mean = self.storage.soft_rewards.mean().item()
+        
+        # Compute termination statistics
+        # Note: truncation should always imply done (dones = terminated | truncated)
+        # but we check for "orphan" truncations just in case
+        is_true_terminal = self.storage.dones.bool() & ~self.storage.truncations.bool()
+        is_orphan_truncation = self.storage.truncations.bool() & ~self.storage.dones.bool()
+        num_true_terminations = is_true_terminal.sum().item()
+        num_truncations = self.storage.truncations.sum().item()
+        num_orphan_truncations = is_orphan_truncation.sum().item()
 
         with torch.no_grad():
             self.old_policy.load_state_dict(self.policy.state_dict())
@@ -212,83 +278,69 @@ class REPPO:
             _,
             _,
             returns_batch,
-            truncations_batch,
+            clean_returns_batch,
             _,
-            old_mean_batch,
-            old_std_batch,
+            _,
+            _,
+            dones_batch,
             hidden_states_batch,
             masks_batch,
+            valid_mask,
         ) in enumerate(generator):
-
             # Build minibatch dict
             minibatch = {
                 "obs_batch": obs_batch,
                 "actions_batch": actions_batch,
                 "returns_batch": returns_batch,
-                "truncations_batch": truncations_batch,
                 "hidden_states_batch": hidden_states_batch,
                 "masks_batch": masks_batch,
-                "old_mean": old_mean_batch,
-                "old_std": old_std_batch,
+                "valid_mask": valid_mask,
+                "dones_batch": dones_batch,
             }
 
             # Update critic
             critic_metrics = self.update_critic(minibatch)
 
-        if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-
-        # Iterate over batches
-        for i, (
-            obs_batch,
-            actions_batch,
-            _,
-            _,
-            returns_batch,
-            truncations_batch,
-            _,
-            old_mean_batch,
-            old_std_batch,
-            hidden_states_batch,
-            masks_batch,
-        ) in enumerate(generator):
-
-            # Build minibatch dict
-            minibatch = {
-                "obs_batch": obs_batch,
-                "actions_batch": actions_batch,
-                "returns_batch": returns_batch,
-                "truncations_batch": truncations_batch,
-                "hidden_states_batch": hidden_states_batch,
-                "masks_batch": masks_batch,
-                "old_mean": old_mean_batch,
-                "old_std": old_std_batch,
-            }
-            
             # Update actor
             actor_metrics = self.update_actor(minibatch)
 
-            # Store the losses
             mean_value_loss += critic_metrics["value_loss"]
+            mean_value_pred_error += critic_metrics["value_prediction_error"]
+            mean_value_pred_std += critic_metrics["value_pred_std"]
+            mean_critic_grad_norm += critic_metrics["critic_grad_norm"]
+            
             mean_entropy += actor_metrics["entropy"]
             mean_surrogate_loss += actor_metrics["actor_loss"]
+            mean_kl_divergence += actor_metrics["kl_divergence"]
+            mean_kl_exceed_frac += actor_metrics["kl_exceed_frac"]
+            mean_kl_std += actor_metrics["kl_std"]
+            mean_kl_max += actor_metrics["kl_max"]
+            mean_q_value_std += actor_metrics["on_policy_values_std"]
+            mean_actor_grad_norm += actor_metrics["actor_grad_norm"]
+            mean_action_std_mean += actor_metrics["action_std_mean"]
+            mean_action_std_min += actor_metrics["action_std_min"]
+            mean_action_std_max += actor_metrics["action_std_max"]
+            mean_action_mean_abs += actor_metrics["action_mean_abs"]
+            mean_primary_policy_loss += actor_metrics["primary_policy_loss"]
 
-        print("value prediction error: ", critic_metrics["value_prediction_error"])
-        print("enc dec error: ", critic_metrics["enc_dec_error"])
-        print("on policy values mean: ", actor_metrics["on_policy_values_mean"])
-        print("entropy: ", actor_metrics["entropy"])
-        print("kl divergence: ", actor_metrics["kl_divergence"])
-        print("entropy target: ", self.target_entropy)
-        print("alpha temp: ", self.policy.alpha_temp.item())
-        print("alpha kl: ", self.policy.alpha_kl.item())
-
-        # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl_divergence /= num_updates
+        mean_kl_exceed_frac /= num_updates
+        mean_kl_std /= num_updates
+        mean_kl_max /= num_updates
+        mean_q_value_std /= num_updates
+        mean_actor_grad_norm /= num_updates
+        mean_critic_grad_norm /= num_updates
+        mean_action_std_mean /= num_updates
+        mean_action_std_min /= num_updates
+        mean_action_std_max /= num_updates
+        mean_action_mean_abs /= num_updates
+        mean_primary_policy_loss /= num_updates
+        mean_value_pred_error /= num_updates
+        mean_value_pred_std /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -299,141 +351,225 @@ class REPPO:
 
         # Construct the loss dictionary
         loss_dict = {
+            # Core losses
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
+            "primary_policy_loss": mean_primary_policy_loss,
+            
+            # Entropy/KL metrics
             "entropy": mean_entropy,
+            "kl_divergence": mean_kl_divergence,
+            "kl_exceed_frac": mean_kl_exceed_frac,
+            "kl_std": mean_kl_std,
+            "kl_max": mean_kl_max,
+            "alpha_temp": self.policy.alpha_temp.item(),
+            "alpha_kl": self.policy.alpha_kl.item(),
+            
+            # Value/return statistics
+            "Train/returns_mean": returns_mean,
+            "Train/returns_std": returns_std,
+            "Train/returns_min": returns_min,
+            "Train/returns_max": returns_max,
+            "Train/clean_returns_mean": clean_returns_mean,
+            "Train/clean_returns_std": clean_returns_std,
+            "Train/clean_returns_min": clean_returns_min,
+            "Train/clean_returns_max": clean_returns_max,
+            "Train/q_value_std": mean_q_value_std,
+            "Train/value_pred_error": mean_value_pred_error,
+            "Train/value_pred_std": mean_value_pred_std,
+            
+            # Reward statistics
+            "Train/rewards_mean": rewards_mean,
+            "Train/rewards_std": rewards_std,
+            "Train/soft_rewards_mean": soft_rewards_mean,
+            
+            # Termination statistics
+            "Train/num_true_terminations": num_true_terminations,
+            "Train/num_truncations": num_truncations,
+            "Train/num_orphan_truncations": num_orphan_truncations,
+            
+            # Gradient statistics
+            "Train/actor_grad_norm": mean_actor_grad_norm,
+            "Train/critic_grad_norm": mean_critic_grad_norm,
+            
+            # Policy distribution statistics
+            "Policy/action_std_mean": mean_action_std_mean,
+            "Policy/action_std_min": mean_action_std_min,
+            "Policy/action_std_max": mean_action_std_max,
+            "Policy/action_mean_abs": mean_action_mean_abs,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
         return loss_dict
-    
+
     def update_actor(self, minibatch: dict) -> dict:
-        """Update the actor network.
-        
-        Args:
-            minibatch: Dictionary containing the minibatch data with keys:
-                - obs_batch: Observations
-                - actions_batch: Actions
-                - returns_batch: Returns
-                - truncations_batch: Truncation flags
-                - hidden_states_batch: Hidden states (for recurrent policies)
-                - masks_batch: Masks (for recurrent policies)
-        
-        Returns:
-            Dictionary containing actor metrics.
-        """
         obs_batch = minibatch["obs_batch"]
         hidden_states_batch = minibatch["hidden_states_batch"]
         masks_batch = minibatch["masks_batch"]
+        valid_mask = minibatch["valid_mask"]
+        dones_batch = minibatch["dones_batch"]
 
-        # Get current actor outputs
         self.policy.act(obs_batch, hidden_states_batch, masks_batch)
         predicted_policy = self.policy.distribution
         predicted_actions = predicted_policy.rsample()
         on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
 
-        # Temperature component
-        entropy = -predicted_policy.log_prob(predicted_actions).sum(-1)
+        entropy = -predicted_policy.log_prob(predicted_actions.clamp(-1 + 1e-6, 1 - 1e-6)).sum(-1)
+        # TODO: mega hack
+        self.policy.alpha_temp.copy_(self.policy.log_alpha_temp.exp() * 0.0 + 0.01)
         entropy_loss = self.policy.alpha_temp.detach() * entropy
-        primary_policy_loss = -(on_policy_values + entropy_loss)
+        primary_policy_loss = -(on_policy_values + entropy_loss).squeeze()
 
-        # KL computation
-        self.old_policy._update_distribution(obs_batch, minibatch["old_mean"], minibatch["old_std"])
+        # Compute KL loss
+        self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
         old_policy_distribution = self.old_policy.distribution
-        old_policy_actions = old_policy_distribution.sample((1,))
+        old_policy_actions = old_policy_distribution.sample((4,)).clamp(-1 + 1e-6, 1 - 1e-6)
         log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
         log_prob_new = predicted_policy.log_prob(old_policy_actions)
         kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
 
-        # Clipped Policy Loss
-        policy_loss = torch.where(
-            (kl_divergence < self.desired_kl).detach(),
-            primary_policy_loss,
-            self.policy.alpha_kl.detach() * kl_divergence,
-        ).mean()
+        kl_loss = (self.policy.alpha_kl.detach() * kl_divergence - self.desired_kl)
 
-        # Temperature updates
-        temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
-        kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
+        # Mask out truncated transitions
+        if valid_mask is not None:
+            valid_mask_flat = valid_mask.view(-1)
+            policy_loss = torch.where(
+                (kl_divergence < self.desired_kl).detach(),
+                primary_policy_loss,
+                kl_loss,
+            )
+            policy_loss = (policy_loss * valid_mask_flat).sum() / valid_mask_flat.sum()
+            entropy_mean = (entropy * valid_mask_flat).sum() / valid_mask_flat.sum()
+            kl_mean = (kl_divergence * valid_mask_flat).sum() / valid_mask_flat.sum()
+        else:
+            policy_loss = torch.where(
+                (kl_divergence < self.desired_kl).detach(),
+                primary_policy_loss,
+                kl_loss,
+            ).mean()
+            entropy_mean = entropy.mean()
+            kl_mean = kl_divergence.mean()
 
-        # Freeze critic parameters to prevent policy loss from updating them
-        self._set_critic_grad(False)
-        self.optimizer.zero_grad()
+        temp_target_loss = self.policy.alpha_temp * (entropy_mean - self.target_entropy).detach()
+        kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_mean).detach()
+
+        self.actor_optimizer.zero_grad()
         actor_loss = policy_loss + temp_target_loss + kl_target_loss
         actor_loss.backward()
-        # Collect gradients from all GPUs
+
+        # Compute gradient statistics before clipping
+        actor_grad_norm = 0.0
+        for p in self.policy.actor.parameters():
+            if p.grad is not None:
+                actor_grad_norm += p.grad.data.norm(2).item() ** 2
+        actor_grad_norm = actor_grad_norm ** 0.5
+
         if self.is_multi_gpu:
             self.reduce_parameters()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+        nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+        self.actor_optimizer.step()
 
-        # Unfreeze critic parameters
-        self._set_critic_grad(True)
+        # Compute diagnostics
+        kl_exceeds_threshold = (kl_divergence >= self.desired_kl).float()
+        if valid_mask is not None:
+            valid_mask_flat = valid_mask.view(-1)
+            kl_exceed_frac = (kl_exceeds_threshold * valid_mask_flat).sum() / valid_mask_flat.sum()
+            q_value_std = (on_policy_values.view(-1) * valid_mask_flat).std()
+            q_value_mean = on_policy_values.view(-1).mean()
+            q_value_min = on_policy_values.min()
+            q_value_max = on_policy_values.max()
+            kl_std = kl_divergence.std().item()
+            kl_max = kl_divergence.max().item()
+        else:
+            kl_exceed_frac = kl_exceeds_threshold.mean()
+            q_value_std = on_policy_values.std()
+            q_value_mean = on_policy_values.view(-1).mean()
+            q_value_min = on_policy_values.min()
+            q_value_max = on_policy_values.max()
+            kl_std = kl_divergence.std().item()
+            kl_max = kl_divergence.max().item()
+
+        # Policy distribution statistics
+        action_std_mean = self.policy.action_std.mean().item()
+        action_std_min = self.policy.action_std.min().item()
+        action_std_max = self.policy.action_std.max().item()
+        action_mean_abs = self.policy.action_mean.abs().mean().item()
 
         return {
             "actor_loss": actor_loss.item(),
-            "entropy": entropy.mean().item(),
-            "kl_divergence": kl_divergence.mean().item(),
+            "entropy": entropy_mean.item() if valid_mask is not None else entropy.mean().item(),
+            "kl_divergence": kl_mean.item() if valid_mask is not None else kl_divergence.mean().item(),
+            "kl_exceed_frac": kl_exceed_frac.item(),
+            "kl_std": kl_std,
+            "kl_max": kl_max,
+            "alpha_temp": self.policy.alpha_temp.item(),
+            "alpha_kl": self.policy.alpha_kl.item(),
             "on_policy_values_mean": on_policy_values.mean().item(),
+            "on_policy_values_std": q_value_std.item(),
+            "actor_grad_norm": actor_grad_norm,
+            "action_std_mean": action_std_mean,
+            "action_std_min": action_std_min,
+            "action_std_max": action_std_max,
+            "action_mean_abs": action_mean_abs,
+            "primary_policy_loss": primary_policy_loss.mean().item(),
+            "q_value_mean": q_value_mean.item(),
+            "q_value_min": q_value_min.item(),
+            "q_value_max": q_value_max.item(),
         }
 
     def update_critic(self, minibatch: dict) -> dict:
-        """Update the critic network.
-        
-        Args:
-            minibatch: Dictionary containing the minibatch data with keys:
-                - obs_batch: Observations
-                - actions_batch: Actions
-                - returns_batch: Returns
-                - truncations_batch: Truncation flags
-                - hidden_states_batch: Hidden states (for recurrent policies)
-                - masks_batch: Masks (for recurrent policies)
-        
-        Returns:
-            Dictionary containing critic metrics.
-        """
         obs_batch = minibatch["obs_batch"]
         actions_batch = minibatch["actions_batch"]
         returns_batch = minibatch["returns_batch"]
-        truncations_batch = minibatch["truncations_batch"]
         hidden_states_batch = minibatch["hidden_states_batch"]
         masks_batch = minibatch["masks_batch"]
+        valid_mask = minibatch["valid_mask"]
 
-        # Get current critic outputs
         value_prediction, value_logits = self.policy.evaluate(
             obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
         )
 
-        # VALUE LOSS
-        # Embed the returns
         embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
+        per_sample_loss = -((embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1))
+        
+        # Mask out truncated transitions
+        if valid_mask is not None:
+            value_loss = (per_sample_loss * valid_mask.view(-1)).sum() / valid_mask.sum()
+        else:
+            value_loss = per_sample_loss.mean()
 
-        # Compute loss
-        value_loss = -(
-            (1.0 - truncations_batch.view(-1))
-            * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
-        ).mean()
-
-        # Compute the gradients
-        self.optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
         value_loss.backward()
-        # Collect gradients from all GPUs
+
+        # Compute gradient statistics before clipping
+        critic_grad_norm = 0.0
+        for p in self.policy.critic.parameters():
+            if p.grad is not None:
+                critic_grad_norm += p.grad.data.norm(2).item() ** 2
+        critic_grad_norm = critic_grad_norm ** 0.5
+
         if self.is_multi_gpu:
             self.reduce_parameters()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+        nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
+        self.critic_optimizer.step()
 
-        # Compute metrics for logging
         value_prediction_error = (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item()
         decoded_returns = self.policy.hlgauss_decode(torch.log(embedded_returns)).detach()
         enc_dec_error = (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item()
+
+        # Additional critic diagnostics
+        value_pred_std = value_prediction.std().item()
+        returns_batch_std = returns_batch.std().item()
 
         return {
             "value_loss": value_loss.item(),
             "value_prediction_error": value_prediction_error,
             "enc_dec_error": enc_dec_error,
+            "critic_grad_norm": critic_grad_norm,
+            "value_pred_std": value_pred_std,
+            "returns_batch_std": returns_batch_std,
         }
 
     def broadcast_parameters(self) -> None:

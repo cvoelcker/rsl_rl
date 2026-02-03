@@ -12,9 +12,8 @@ from tensordict import TensorDict
 from rsl_rl.networks import HiddenState
 from rsl_rl.utils import split_and_pad_trajectories
 
+
 class Transition:
-
-
     """Storage for a single state transition."""
 
     def __init__(self) -> None:
@@ -23,10 +22,12 @@ class Transition:
         self.privileged_actions: torch.Tensor | None = None
         self.rewards: torch.Tensor | None = None
         self.soft_rewards: torch.Tensor | None = None
+        self.clean_returns: torch.Tensor | None = None
         self.dones: torch.Tensor | None = None
         self.truncations: torch.Tensor | None = None
         self.values: torch.Tensor | None = None
         self.actions_log_prob: torch.Tensor
+        self.next_actions_log_prob: torch.Tensor | None = None
         self.action_mean: torch.Tensor | None = None
         self.action_sigma: torch.Tensor | None = None
         self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
@@ -34,12 +35,14 @@ class Transition:
     def clear(self) -> None:
         self.__init__()
 
+
 class RolloutStorage:
     """Storage for the data collected during a rollout.
 
     The rollout storage is populated by adding transitions during the rollout phase. It then returns a generator for
     learning, depending on the algorithm and the policy architecture.
     """
+
     def __init__(
         self,
         training_type: str,
@@ -78,6 +81,7 @@ class RolloutStorage:
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.clean_returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For RNN networks
@@ -99,8 +103,8 @@ class RolloutStorage:
         if transition.soft_rewards is not None:
             self.soft_rewards[self.step].copy_(transition.soft_rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
-        self.truncations[self.step].copy_(transition.truncations.view(-1, 1))
-
+        if transition.truncations is not None:
+            self.truncations[self.step].copy_(transition.truncations.view(-1, 1))
         # For distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
@@ -127,67 +131,81 @@ class RolloutStorage:
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
-            yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i], self.truncations[i]
+            yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i]
 
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        batch_size = self.num_envs * self.num_transitions_per_env
-        mini_batch_size = batch_size // num_mini_batches
-        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        # Core
+        # Flatten all data
         observations = self.observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
-        truncations = self.truncations.flatten(0, 1)
-
-        # For PPO
+        clean_returns = self.clean_returns.flatten(0, 1)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
 
+        termination = self.dones.flatten(0, 1)
+        truncation = self.truncations.flatten(0, 1)
+        dones = termination & ~truncation
+
+        # Mask out truncated transitions (they have invalid value targets)
+        truncation_mask = ~self.truncations.flatten(0, 1).squeeze(-1).bool()
+        valid_indices = torch.nonzero(truncation_mask, as_tuple=False).squeeze(-1)
+        num_valid = valid_indices.shape[0]
+
+        # Compute batch sizes based on valid transitions
+        mini_batch_size = num_valid // num_mini_batches
+
         for epoch in range(num_epochs):
+            # Shuffle valid indices each epoch
+            perm = torch.randperm(num_valid, requires_grad=False, device=self.device)
+            shuffled_indices = valid_indices[perm]
+
             for i in range(num_mini_batches):
-                # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
-                batch_idx = indices[start:stop]
+                batch_idx = shuffled_indices[start:stop]
 
                 # Create the mini-batch
                 obs_batch = observations[batch_idx]
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
-                truncations_batch = truncations[batch_idx]
+                clean_returns_batch = clean_returns[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
 
+                dones_batch = dones[batch_idx]
+
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
                 masks_batch = None
 
-                # Yield the mini-batch
+                # Yield the mini-batch (no valid_mask needed since we filtered truncations)
                 yield (
                     obs_batch,
                     actions_batch,
                     target_values_batch,
                     advantages_batch,
                     returns_batch,
-                    truncations_batch,
+                    clean_returns_batch,
                     old_actions_log_prob_batch,
                     old_mu_batch,
                     old_sigma_batch,
+                    dones_batch,
                     (
                         hidden_state_a_batch,
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    None,  # valid_mask - None for feedforward since truncations are filtered out
                 )
 
     # For reinforcement learning with recurrent networks
@@ -195,6 +213,12 @@ class RolloutStorage:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+
+        # For recurrent training, we create a mask for truncated transitions
+        # so they don't contribute to losses while maintaining trajectory structure
+        truncation_mask = self.truncations.squeeze(-1).bool()
+        # Mask for valid (non-truncated) transitions: 1.0 for valid, 0.0 for truncated
+        valid_mask = (~truncation_mask).float().unsqueeze(-1)
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -216,9 +240,11 @@ class RolloutStorage:
                 old_mu_batch = self.mu[:, start:stop]
                 old_sigma_batch = self.sigma[:, start:stop]
                 returns_batch = self.returns[:, start:stop]
+                clean_returns_batch = self.clean_returns[:, start:stop]
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                valid_mask_batch = valid_mask[:, start:stop]
 
                 # Reshape to [num_envs, time, num layers, hidden dim]
                 # Original shape: [time, num_layers, num_envs, hidden_dim])
@@ -226,13 +252,15 @@ class RolloutStorage:
                 # Take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 hidden_state_a_batch = [
-                    saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                    saved_hidden_state
+                    .permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                     .transpose(1, 0)
                     .contiguous()
                     for saved_hidden_state in self.saved_hidden_state_a
                 ]
                 hidden_state_c_batch = [
-                    saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                    saved_hidden_state
+                    .permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                     .transpose(1, 0)
                     .contiguous()
                     for saved_hidden_state in self.saved_hidden_state_c
@@ -252,6 +280,7 @@ class RolloutStorage:
                     values_batch,
                     advantages_batch,
                     returns_batch,
+                    clean_returns_batch,
                     old_actions_log_prob_batch,
                     old_mu_batch,
                     old_sigma_batch,
@@ -260,6 +289,7 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    valid_mask_batch,
                 )
 
                 first_traj = last_traj
@@ -287,13 +317,14 @@ class RolloutStorage:
 
 
 class HybridStorage:
-    """Stoarge for hybrid on-policy off-policy replay buffers.
-    """
+    """Stoarge for hybrid on-policy off-policy replay buffers."""
 
-    def __init__(self,
+    def __init__(
+        self,
         num_envs: int,
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
-        device: str = "cpu",) -> None:
+        device: str = "cpu",
+    ) -> None:
         pass

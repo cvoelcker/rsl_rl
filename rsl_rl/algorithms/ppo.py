@@ -145,10 +145,12 @@ class PPO:
             self.rnd.update_normalization(obs)
 
         # Record the rewards and dones
-        # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
-        self.transition.truncations = extras["time_outs"].to(self.device) * 1.0
+        # Store truncations (time_outs) separately for proper handling in compute_returns
+        # Note: We do NOT bootstrap here because obs is post-reset and causally unrelated
+        # to the truncated transition. Truncation bootstrap is handled in compute_returns.
+        self.transition.truncations = extras.get("time_outs", torch.zeros_like(dones)).to(self.device)
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -156,12 +158,6 @@ class PPO:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
-
-        # Bootstrapping on time outs
-        if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
-            )
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -174,17 +170,29 @@ class PPO:
         last_values = self.policy.evaluate(obs).detach()
         # Compute returns and advantages
         advantage = 0
+        recurr_value = 0.0
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
-            # 1 if we are not in a terminal state, 0 otherwise
-            next_is_not_terminal = 1.0 - st.dones[step].float()
-            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
+
+            # Truncated transitions are masked from training. Set delta=0 to avoid polluting GAE.
+            # True terminals should zero out the bootstrap.
+            is_truncated = st.truncations[step].bool()
+            is_true_terminal = st.dones[step].bool() & ~is_truncated
+            next_is_not_terminal = 1.0 - is_true_terminal.float()
+
+            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t), zeroed for truncations
             delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+            delta = torch.where(is_truncated, torch.zeros_like(delta), delta)
+
+            # Advantage propagation stops at ANY done (episode boundary)
+            next_is_not_done = 1.0 - st.dones[step].float()
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
-            advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+            advantage = delta + next_is_not_done * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
+            recurr_value = next_is_not_terminal * (recurr_value + self.gamma * st.rewards[step])
+            st.clean_returns[step] = recurr_value
         # Compute the advantages
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
@@ -195,10 +203,51 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl_divergence = 0
+        mean_clip_frac = 0
+        mean_advantage_std = 0
+        mean_ratio_std = 0
+        mean_grad_norm = 0
+        mean_value_pred_error = 0
+        mean_action_std_mean = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+
+        # Compute return/advantage statistics before update (for diagnostics)
+        returns_mean = self.storage.returns.mean().item()
+        returns_std = self.storage.returns.std().item()
+        returns_min = self.storage.returns.min().item()
+        returns_max = self.storage.returns.max().item()
+
+        # Compute clean returns
+        clean_returns_mean = self.storage.clean_returns[0].mean().item()
+        clean_returns_std = self.storage.clean_returns[0].std().item()
+        clean_returns_min = self.storage.clean_returns[0].min().item()
+        clean_returns_max = self.storage.clean_returns[0].max().item()
+
+        advantages_mean = self.storage.advantages.mean().item()
+        advantages_std = self.storage.advantages.std().item()
+        
+        # Compute reward statistics
+        rewards_mean = self.storage.rewards.mean().item()
+        rewards_std = self.storage.rewards.std().item()
+        
+        # Compute termination statistics
+        # Note: truncation should always imply done (dones = terminated | truncated)
+        # but we check for "orphan" truncations just in case
+        is_true_terminal = self.storage.dones.bool() & ~self.storage.truncations.bool()
+        is_orphan_truncation = self.storage.truncations.bool() & ~self.storage.dones.bool()
+        num_true_terminations = is_true_terminal.sum().item()
+        num_truncations = self.storage.truncations.sum().item()
+        num_orphan_truncations = is_orphan_truncation.sum().item()
+
+        # min max stats on actions
+        actions_mean = self.storage.actions.mean().item()
+        actions_std = self.storage.actions.std().item()
+        actions_min = self.storage.actions.min().item()
+        actions_max = self.storage.actions.max().item()
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -213,12 +262,14 @@ class PPO:
             target_values_batch,
             advantages_batch,
             returns_batch,
-            _,
+        _, 
             old_actions_log_prob_batch,
             old_mu_batch,
             old_sigma_batch,
+            _,
             hidden_states_batch,
             masks_batch,
+            valid_mask,
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -292,26 +343,41 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
+            # Surrogate loss (masked for recurrent to exclude truncated transitions)
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            if valid_mask is not None:
+                surrogate_loss = (torch.max(surrogate, surrogate_clipped) * valid_mask.squeeze(-1)).sum() / valid_mask.sum()
+            else:
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
+            # Value function loss (masked for recurrent to exclude truncated transitions)
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
                 )
                 value_losses = (value_batch - returns_batch).pow(2)
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                if valid_mask is not None:
+                    value_loss = (torch.max(value_losses, value_losses_clipped) * valid_mask).sum() / valid_mask.sum()
+                else:
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+                if valid_mask is not None:
+                    value_loss = ((returns_batch - value_batch).pow(2) * valid_mask).sum() / valid_mask.sum()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Entropy (masked for recurrent)
+            if valid_mask is not None:
+                entropy_mean = (entropy_batch * valid_mask.squeeze(-1)).sum() / valid_mask.sum()
+            else:
+                entropy_mean = entropy_batch.mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_mean
 
             # Symmetry loss
             if self.symmetry:
@@ -364,6 +430,14 @@ class PPO:
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Compute gradient norm before clipping
+            grad_norm = 0.0
+            for p in self.policy.parameters():
+                if p.grad is not None:
+                    grad_norm += p.grad.data.norm(2).item() ** 2
+            grad_norm = grad_norm ** 0.5
+
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
@@ -380,10 +454,37 @@ class PPO:
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            # Store the losses
+            # Compute diagnostics for this batch
+            with torch.no_grad():
+                # Clip fraction: how many ratios were clipped
+                clip_frac = ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
+                # Value prediction error
+                value_pred_error = (value_batch - returns_batch).abs().mean().item()
+                # KL divergence (already computed above for adaptive schedule)
+                if self.desired_kl is not None and self.schedule == "adaptive":
+                    batch_kl = kl_mean.item()
+                else:
+                    # Compute KL if not already done
+                    kl = torch.sum(
+                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
+                        / (2.0 * torch.square(sigma_batch))
+                        - 0.5,
+                        axis=-1,
+                    )
+                    batch_kl = kl.mean().item()
+
+            # Store the losses and diagnostics
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
-            mean_entropy += entropy_batch.mean().item()
+            mean_entropy += entropy_mean.item()
+            mean_kl_divergence += batch_kl
+            mean_clip_frac += clip_frac
+            mean_advantage_std += advantages_batch.std().item()
+            mean_ratio_std += ratio.std().item()
+            mean_grad_norm += grad_norm
+            mean_value_pred_error += value_pred_error
+            mean_action_std_mean += sigma_batch.mean().item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -396,6 +497,13 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl_divergence /= num_updates
+        mean_clip_frac /= num_updates
+        mean_advantage_std /= num_updates
+        mean_ratio_std /= num_updates
+        mean_grad_norm /= num_updates
+        mean_value_pred_error /= num_updates
+        mean_action_std_mean /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -406,9 +514,44 @@ class PPO:
 
         # Construct the loss dictionary
         loss_dict = {
+            # Core losses
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            
+            # KL/clipping metrics
+            "kl_divergence": mean_kl_divergence,
+            "clip_frac": mean_clip_frac,
+            
+            # Value/return statistics
+            "Train/returns_mean": returns_mean,
+            "Train/returns_std": returns_std,
+            "Train/returns_min": returns_min,
+            "Train/returns_max": returns_max,
+            "Train/clean_returns_mean": clean_returns_mean,
+            "Train/clean_returns_std": clean_returns_std,
+            "Train/clean_returns_min": clean_returns_min,
+            "Train/clean_returns_max": clean_returns_max,
+            "Train/advantages_mean": advantages_mean,
+            "Train/advantages_std": advantages_std,
+            "Train/value_pred_error": mean_value_pred_error,
+            
+            # Reward statistics
+            "Train/rewards_mean": rewards_mean,
+            "Train/rewards_std": rewards_std,
+            
+            # Termination statistics
+            "Train/num_true_terminations": num_true_terminations,
+            "Train/num_truncations": num_truncations,
+            "Train/num_orphan_truncations": num_orphan_truncations,
+            
+            # Gradient/ratio statistics
+            "Train/grad_norm": mean_grad_norm,
+            "Train/ratio_std": mean_ratio_std,
+            "Train/advantage_std_minibatch": mean_advantage_std,
+            
+            # Policy distribution statistics
+            "Policy/action_std_mean": mean_action_std_mean,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

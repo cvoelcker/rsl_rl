@@ -9,7 +9,61 @@ import torch
 import torch.nn as nn
 from functools import reduce
 
-from rsl_rl.utils import get_param, resolve_nn_activation
+from rsl_rl.networks.sem import SimplicalEmbeddingModule
+from rsl_rl.utils import resolve_nn_activation
+
+
+class NormedActivation(nn.Module):
+    """A layer that applies RMSNorm followed by an activation function."""
+
+    def __init__(self, dim: int, activation: str = "elu") -> None:
+        """Initialize the NormedActivationLayer.
+
+        Args:
+            dim: Dimension of the input tensor.
+            activation: Activation function.
+        """
+        super().__init__()
+        self.norm = nn.RMSNorm(dim)
+        self.activation = resolve_nn_activation(activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the NormedActivationLayer.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor after applying RMSNorm and activation.
+        """
+        x = self.activation(x)
+        x = self.norm(x)
+        return x
+    
+
+class ActivationLayer(nn.Module):
+    """A layer that applies an activation function."""
+
+    def __init__(self, activation: str = "elu") -> None:
+        """Initialize the ActivationLayer.
+
+        Args:
+            activation: Activation function.
+        """
+        super().__init__()
+        self.activation = resolve_nn_activation(activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the ActivationLayer.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor after applying activation.
+        """
+        x = self.activation(x)
+        return x
 
 
 class MLP(nn.Sequential):
@@ -30,6 +84,8 @@ class MLP(nn.Sequential):
         hidden_dims: tuple[int] | list[int],
         activation: str = "elu",
         last_activation: str | None = None,
+        use_layer_norm: bool = False,
+        add_sem: bool = False,
     ) -> None:
         """Initialize the MLP.
 
@@ -43,6 +99,9 @@ class MLP(nn.Sequential):
         """
         super().__init__()
 
+        if add_sem and use_layer_norm:
+            raise ValueError("Cannot use both SEM and RMSNorm in the MLP.")
+
         # Resolve activation functions
         activation_mod = resolve_nn_activation(activation)
         last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
@@ -52,21 +111,29 @@ class MLP(nn.Sequential):
         # Create layers sequentially
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
-        layers.append(nn.LayerNorm(hidden_dims_processed[0]))
+        if use_layer_norm:
+            layers.append(nn.RMSNorm(hidden_dims_processed[0]))
         layers.append(activation_mod)
 
         for layer_index in range(len(hidden_dims_processed) - 1):
             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
-            layers.append(nn.LayerNorm(hidden_dims_processed[layer_index + 1]))
+            if use_layer_norm:
+                layers.append(nn.RMSNorm(hidden_dims_processed[layer_index + 1]))
             layers.append(activation_mod)
 
+        if add_sem:
+            layers.append(SimplicalEmbeddingModule(embed_dim=hidden_dims_processed[-1], chunk_size=16))
+
         # Add last layer
+        total_out_dim = output_dim if isinstance(output_dim, int) else reduce(lambda x, y: x * y, output_dim)
         if isinstance(output_dim, int):
-            layers.append(nn.Linear(hidden_dims_processed[-1], output_dim))
+            if use_layer_norm:
+                layers.append(nn.RMSNorm(hidden_dims_processed[-1]))
+            layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
         else:
-            # Compute the total output dimension
-            total_out_dim = reduce(lambda x, y: x * y, output_dim)
             # Add a layer to reshape the output to the desired shape
+            if use_layer_norm:
+                layers.append(nn.RMSNorm(hidden_dims_processed[-1]))
             layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
             layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
 
@@ -78,16 +145,16 @@ class MLP(nn.Sequential):
         for idx, layer in enumerate(layers):
             self.add_module(f"{idx}", layer)
 
-    def init_weights(self, scales: float | tuple[float]) -> None:
-        """Initialize the weights of the MLP.
+    # def init_weights(self, scales: float | tuple[float]) -> None:
+    #     """Initialize the weights of the MLP.
 
-        Args:
-            scales: Scale factor for the weights.
-        """
-        for idx, module in enumerate(self):
-            if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=get_param(scales, idx))
-                nn.init.zeros_(module.bias)
+    #     Args:
+    #         scales: Scale factor for the weights.
+    #     """
+    #     for idx, module in enumerate(self):
+    #         if isinstance(module, nn.Linear):
+    #             nn.init.orthogonal_(module.weight, gain=get_param(scales, idx))
+    #             nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the MLP."""

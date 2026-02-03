@@ -2,8 +2,8 @@
 class_name: OnPolicyRunner
 
 # General
-num_steps_per_env: 64
-max_iterations: 5000
+num_steps_per_env: 128
+max_iterations: 1000
 seed: 1
 
 # Observations
@@ -11,39 +11,43 @@ obs_groups: {policy: [policy], critic: [critic]}
 
 # Logging
 save_interval: 50
-experiment_name: walking_experiment
-run_name: ""
+experiment_name: h1_rough
+run_name: reppo
 logger: wandb  # tensorboard, neptune, wandb
 neptune_project: legged_gym
 wandb_project: legged_gym
 
 policy:
   class_name: ActorQ
-  activation: swish
-  actor_obs_normalization: true
-  critic_obs_normalization: true
-  actor_hidden_dims: [512, 512, 256]
-  critic_hidden_dims: [1024, 512, 256]
-  num_critic_bins: 151
-  vmin: -20.0
-  vmax: 20.0
-  init_noise_std: 0.1
-  noise_std_type: sigmoid
-  state_dependent_std: true
-  distribution_type: tanh  # normal or tanh
-  init_alpha_temp: 0.01
-  init_alpha_kl: 0.1
+  activation: elu
+  actor_obs_normalization: false
+  critic_obs_normalization: false
+  actor_hidden_dims: [512, 512]
+  critic_hidden_dims: [512, 512, 512]
+  num_critic_bins: 51
+  vmin: -5.0
+  vmax: 5.0
+  init_noise_std: 0.5
+  noise_std_type: log
+  state_dependent_std:  true
+  distribution_type: normal  # normal or ta
+  init_alpha_temp: 0.001
+  init_alpha_kl: 0.01
+  kl_num_samples: 4
+  add_sem: false
+  add_layer_norm: true
+  min_noise_std: 0.001
 
 algorithm:
   class_name: REPPO
   learning_rate: 0.0003
-  num_learning_epochs: 8
+  num_learning_epochs: 4
   num_mini_batches: 32
   desired_kl: 0.1
   target_entropy: -0.5
-  gamma: 0.99
+  gamma: 0.97
   lam: 0.95
-  max_grad_norm: 1.0
+  max_grad_norm: 0.5
 
   scale_actions: false
   action_upper_bound: 1.0
