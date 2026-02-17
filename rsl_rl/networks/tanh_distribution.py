@@ -27,9 +27,18 @@ class TanhNormal(TransformedDistribution):
     arg_constraints = {"loc": constraints.real, "scale": constraints.positive}
     has_rsample = True
 
-    def __init__(self, loc: Tensor, scale: Tensor, validate_args: bool | None = None):
+    def __init__(self, loc: Tensor, scale: Tensor, validate_args: bool | None = None, action_lower_bound: Tensor | float | None = None, action_upper_bound: Tensor | float | None = None) -> None:
         self.loc = loc
         self.scale = scale
+        self.action_bounds_lower = action_lower_bound
+        self.action_bounds_upper = action_upper_bound
+        # comute mean offset as intermediate between upper and lower bound
+        if self.action_bounds_lower is not None and self.action_bounds_upper is not None:
+            self._mean_offset = (self.action_bounds_upper + self.action_bounds_lower) / 2.0
+            self._scale = (self.action_bounds_upper - self.action_bounds_lower) / 2.0
+        else:
+            self._mean_offset = 0.0
+            self._scale = 1.0
         base_dist = Normal(loc, scale, validate_args=validate_args)
         # cache_size=1 caches the transform for rsample -> log_prob pattern
         super().__init__(base_dist, TanhTransform(cache_size=1), validate_args=validate_args)
@@ -37,7 +46,7 @@ class TanhNormal(TransformedDistribution):
     @property
     def mean(self) -> Tensor:
         """Mean of the distribution (tanh of the underlying mean)."""
-        return torch.tanh(self.loc)
+        return self._mean_offset + self._scale * torch.tanh(self.loc)
 
     @property
     def mode(self) -> Tensor:
@@ -47,7 +56,7 @@ class TanhNormal(TransformedDistribution):
     @property
     def stddev(self) -> Tensor:
         """Standard deviation of the underlying Normal distribution."""
-        return self.scale
+        return self.scale * (1 - torch.tanh(self.loc) ** 2)
 
     def log_prob(self, value: Tensor) -> Tensor:
         """Compute log probability with numerically stable Jacobian correction.
@@ -65,6 +74,9 @@ class TanhNormal(TransformedDistribution):
         if self._validate_args:
             self._validate_sample(value)
 
+        # recenter action
+        value = (value - self._mean_offset) / self._scale
+
         # Inverse tanh (atanh) to get the pre-squashed value
         # Clamp to avoid numerical issues at boundaries
         eps = torch.finfo(value.dtype).eps
@@ -78,15 +90,15 @@ class TanhNormal(TransformedDistribution):
         # Using: log(1 - tanh²(x)) = 2 * (log(2) - x - softplus(-2x))
         log_det_jacobian = 2.0 * (math.log(2.0) - pre_tanh - nn.functional.softplus(-2.0 * pre_tanh))
 
-        return log_prob - log_det_jacobian
+        return log_prob - log_det_jacobian - torch.log(self._scale)
 
     def rsample(self, sample_shape: torch.Size = torch.Size()) -> Tensor:
         """Reparameterized sample from the distribution."""
-        return super().rsample(sample_shape)
+        return super().rsample(sample_shape) * self._scale + self._mean_offset
 
     def sample(self, sample_shape: torch.Size = torch.Size()) -> Tensor:
         """Sample from the distribution (not differentiable)."""
-        return super().sample(sample_shape)
+        return super().sample(sample_shape) * self._scale + self._mean_offset
 
     def entropy(self) -> Tensor:
         """Approximate entropy of the distribution.
@@ -95,13 +107,15 @@ class TanhNormal(TransformedDistribution):
         This returns the entropy of the base Normal, which is an upper bound.
         For exact entropy, use Monte Carlo estimation.
         """
-        return self.base_dist.entropy()
+        return self.base_dist.entropy() - torch.log(self._scale)
 
     def expand(self, batch_shape: torch.Size, _instance=None) -> "TanhNormal":
         """Expand the distribution to a new batch shape."""
         new = self._get_checked_instance(TanhNormal, _instance)
         new.loc = self.loc.expand(batch_shape)
         new.scale = self.scale.expand(batch_shape)
+        new._mean_offset = self._mean_offset.expand(batch_shape)
+        new._scale = self._scale.expand(batch_shape)
         base_dist = Normal(new.loc, new.scale, validate_args=False)
         super(TanhNormal, new).__init__(base_dist, TanhTransform(cache_size=1), validate_args=False)
         new._validate_args = self._validate_args

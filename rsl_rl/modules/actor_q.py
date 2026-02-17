@@ -39,6 +39,8 @@ class ActorQ(nn.Module):
         distribution_type: str = "tanh",
         init_alpha_temp: float = 0.1,
         init_alpha_kl: float = 0.1,
+        action_lower_bound: float = -1.0,
+        action_upper_bound: float = 1.0,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -104,6 +106,8 @@ class ActorQ(nn.Module):
             sigma=0.75,
             offset_mult=40.0,
         )
+        self.action_lower_bound = action_lower_bound
+        self.action_upper_bound = action_upper_bound
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization
@@ -221,7 +225,7 @@ class ActorQ(nn.Module):
         if self.distribution_type == "normal":
             self.distribution = Normal(mean, std)
         elif self.distribution_type == "tanh":
-            self.distribution = TanhNormal(mean, std)
+            self.distribution = TanhNormal(mean, std, action_lower_bound=self.action_lower_bound, action_upper_bound=self.action_upper_bound)
 
     def act(self, obs: TensorDict, *args, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)

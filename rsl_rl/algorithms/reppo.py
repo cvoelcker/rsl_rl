@@ -145,7 +145,7 @@ class REPPO:
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
-        self.transition.dones = dones
+        self.transition.dones = dones & ~extras.get("time_outs", torch.zeros_like(dones, dtype=torch.bool)).to(self.device)
         self.transition.truncations = extras["time_outs"].to(self.device) * 1.0
 
         # Compute the intrinsic rewards and add to extrinsic rewards
@@ -340,10 +340,11 @@ class REPPO:
         primary_policy_loss = -(on_policy_values + entropy_loss)
 
         # KL computation
-        self.old_policy._update_distribution(obs_batch, minibatch["old_mean"], minibatch["old_std"])
-        old_policy_distribution = self.old_policy.distribution
-        old_policy_actions = old_policy_distribution.sample((1,))
-        log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
+        with torch.no_grad():
+            self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
+            old_policy_distribution = self.old_policy.distribution
+            old_policy_actions = old_policy_distribution.sample((4,))
+            log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
         log_prob_new = predicted_policy.log_prob(old_policy_actions)
         kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
 

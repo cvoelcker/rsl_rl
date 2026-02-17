@@ -1,4 +1,3 @@
-[2026/01/30] 🚨🚨🚨 We found two major bugs in the implementation which are currently being fixed 🚨🚨🚨
 
 # RSL-RL ❤️ REPPO
 
@@ -24,10 +23,14 @@ The library currently supports **PPO** and **Student-Teacher Distillation** with
 We welcome contributions from the community. Please check our contribution guidelines for more
 information.
 
-**Maintainer**: Mayank Mittal and Clemens Schwarke <br/>
+**Maintainer**: Mayank Mittal and Clemens Schwarke, REPPO maintainer: Claas Voelcker <br/>
 **Affiliation**: Robotic Systems Lab, ETH Zurich & NVIDIA <br/>
 **Contact**: cschwarke@ethz.ch
 
+## News
+
+[2026/02/17] Bugs should be cleared and we are releasing some training tipps for REPPO + Isaac
+[2026/01/30] We found two major bugs in the implementation which are currently being fixed
 
 ## Setup
 
@@ -53,6 +56,16 @@ The package supports the following logging frameworks which can be configured th
 
 For a demo configuration of PPO, please check the [example_config.yaml](config/example_config.yaml) file.
 
+## REPPO + Isaac Training Tips
+
+Max entropy RL algorithms struggle on some Isaac tasks, as the action space is not bounded by -1 to 1.
+We have provided some simple utilities for scaling the tanh Gaussian between arbitrary lower and upper action bounds per dimension.
+This can be accomplished by setting the action lower and upper bounds in the actor.
+We have found that scaling the actions in the actor instead of scaling them in the environment wrapper leads to more stable training.
+
+It is also possible to use a non-squashed Normal distribution, but in this case, the std deviation of the actor plicy needs to be constrained.
+
+Finally, we observed that the curricula used in some Isaac environments have a strong influence on REPPO performance. In general, REPPO learns a strong policy much faster than PPO, but struggles to adapt to the distribution shift introduced by the curriculum.
 
 ## Contribution Guidelines
 
