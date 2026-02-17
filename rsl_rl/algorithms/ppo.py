@@ -191,7 +191,7 @@ class PPO:
             advantage = delta + next_is_not_done * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
-            recurr_value = next_is_not_terminal * (recurr_value + self.gamma * st.rewards[step])
+            recurr_value = next_is_not_terminal * (self.gamma * recurr_value + st.rewards[step])
             st.clean_returns[step] = recurr_value
         # Compute the advantages
         st.advantages = st.returns - st.values
@@ -204,12 +204,18 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_kl_divergence = 0
+        mean_kl_exceed_frac = 0
+        mean_kl_std = 0
+        mean_kl_max = 0
         mean_clip_frac = 0
         mean_advantage_std = 0
         mean_ratio_std = 0
         mean_grad_norm = 0
         mean_value_pred_error = 0
+        mean_value_pred_std = 0
+        mean_value_q_std = 0
         mean_action_std_mean = 0
+        mean_action_mean_abs = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -239,21 +245,63 @@ class PPO:
         # but we check for "orphan" truncations just in case
         is_true_terminal = self.storage.dones.bool() & ~self.storage.truncations.bool()
         is_orphan_truncation = self.storage.truncations.bool() & ~self.storage.dones.bool()
+        is_double_terminal = self.storage.dones.bool() & self.storage.truncations.bool()
         num_true_terminations = is_true_terminal.sum().item()
         num_truncations = self.storage.truncations.sum().item()
         num_orphan_truncations = is_orphan_truncation.sum().item()
+        num_double_terminations = is_double_terminal.sum().item()
 
-        # min max stats on actions
-        actions_mean = self.storage.actions.mean().item()
-        actions_std = self.storage.actions.std().item()
-        actions_min = self.storage.actions.min().item()
-        actions_max = self.storage.actions.max().item()
+        # min max stats on actions per dimension
+        actions = torch.flatten(self.storage.actions, start_dim=0, end_dim=1)
+        actions_mean = actions.mean(dim=0)
+        actions_std = actions.std(dim=0)
+        actions_min = actions.min(dim=0)[0]
+        actions_max = actions.max(dim=0)[0]
+        # 0.1, 0.25, 0.75, 0.9 percentiles
+        actions_perc_025 = torch.quantile(actions, 0.25, dim=0)
+        actions_perc_10 = torch.quantile(actions, 0.1, dim=0)
+        actions_perc_25 = torch.quantile(actions, 0.25, dim=0)
+        actions_perc_75 = torch.quantile(actions, 0.75, dim=0)
+        actions_perc_90 = torch.quantile(actions, 0.9, dim=0)
+        actions_perc_975 = torch.quantile(actions, 0.975, dim=0)
+        print(f"Actions mean: {actions_mean}")
+        print(f"Actions std: {actions_std}")
+        print(f"Actions min: {actions_min}")
+        print(f"Actions max: {actions_max}")
+        print(f"Actions 10th percentile: {actions_perc_10}")
+        print(f"Actions 25th percentile: {actions_perc_25}")
+        print(f"Actions 75th percentile: {actions_perc_75}")
+        print(f"Actions 90th percentile: {actions_perc_90}")
+        print(f"Actions 2.5th percentile: {actions_perc_025}")
+        print(f"Actions 97.5th percentile: {actions_perc_975}")
+        print(actions.shape)
+
+        # log action bounds to disc
+        torch.save(
+            {
+                "actions_mean": actions_mean,
+                "actions_std": actions_std,
+                "actions_min": actions_min,
+                "actions_max": actions_max,
+                "actions_perc_025": actions_perc_025,
+                "actions_perc_10": actions_perc_10,
+                "actions_perc_25": actions_perc_25,
+                "actions_perc_75": actions_perc_75,
+                "actions_perc_90": actions_perc_90,
+                "actions_perc_975": actions_perc_975,
+            }, "action_stats.pt"
+        )
 
         # Get mini batch generator
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
+        obs_min = None
+        obs_max = None
+        obs_norm_min = None
+        obs_norm_max = None
 
         # Iterate over batches
         for (
@@ -460,9 +508,13 @@ class PPO:
                 clip_frac = ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
                 # Value prediction error
                 value_pred_error = (value_batch - returns_batch).abs().mean().item()
+                value_pred_std = value_batch.std().item()
                 # KL divergence (already computed above for adaptive schedule)
                 if self.desired_kl is not None and self.schedule == "adaptive":
                     batch_kl = kl_mean.item()
+                    kl_std = kl.std().item()
+                    kl_max = kl.max().item()
+                    kl_exceed_frac = (kl >= self.desired_kl).float().mean().item()
                 else:
                     # Compute KL if not already done
                     kl = torch.sum(
@@ -473,18 +525,49 @@ class PPO:
                         axis=-1,
                     )
                     batch_kl = kl.mean().item()
+                    kl_std = kl.std().item()
+                    kl_max = kl.max().item()
+                    if self.desired_kl is not None:
+                        kl_exceed_frac = (kl >= self.desired_kl).float().mean().item()
+                    else:
+                        kl_exceed_frac = 0.0
+
+                critic_obs = self.policy.get_critic_obs(obs_batch)
+                if isinstance(critic_obs, tuple):
+                    critic_obs = critic_obs[0]
+                critic_obs_norm = self.policy.critic_obs_normalizer(critic_obs)
+                batch_obs_min = critic_obs.min()
+                batch_obs_max = critic_obs.max()
+                batch_obs_norm_min = critic_obs_norm.min()
+                batch_obs_norm_max = critic_obs_norm.max()
+                if obs_min is None:
+                    obs_min = batch_obs_min
+                    obs_max = batch_obs_max
+                    obs_norm_min = batch_obs_norm_min
+                    obs_norm_max = batch_obs_norm_max
+                else:
+                    obs_min = torch.min(obs_min, batch_obs_min)
+                    obs_max = torch.max(obs_max, batch_obs_max)
+                    obs_norm_min = torch.min(obs_norm_min, batch_obs_norm_min)
+                    obs_norm_max = torch.max(obs_norm_max, batch_obs_norm_max)
 
             # Store the losses and diagnostics
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_mean.item()
             mean_kl_divergence += batch_kl
+            mean_kl_exceed_frac += kl_exceed_frac
+            mean_kl_std += kl_std
+            mean_kl_max += kl_max
             mean_clip_frac += clip_frac
             mean_advantage_std += advantages_batch.std().item()
             mean_ratio_std += ratio.std().item()
             mean_grad_norm += grad_norm
             mean_value_pred_error += value_pred_error
+            mean_value_pred_std += value_pred_std
+            mean_value_q_std += value_batch.std().item()
             mean_action_std_mean += sigma_batch.mean().item()
+            mean_action_mean_abs += mu_batch.abs().mean().item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -498,12 +581,18 @@ class PPO:
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_kl_divergence /= num_updates
+        mean_kl_exceed_frac /= num_updates
+        mean_kl_std /= num_updates
+        mean_kl_max /= num_updates
         mean_clip_frac /= num_updates
         mean_advantage_std /= num_updates
         mean_ratio_std /= num_updates
         mean_grad_norm /= num_updates
         mean_value_pred_error /= num_updates
+        mean_value_pred_std /= num_updates
+        mean_value_q_std /= num_updates
         mean_action_std_mean /= num_updates
+        mean_action_mean_abs /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -512,51 +601,83 @@ class PPO:
         # Clear the storage
         self.storage.clear()
 
+        # print min max actions per dimension
+        print(f"Min actions: {self.storage.actions.min(dim=0).values}, \n Max actions: {self.storage.actions.max(dim=0).values}")
+        print(f"Total max action: {self.storage.actions.max().item()}, \n Total min action: {self.storage.actions.min().item()}")
+
+        action_std_min = self.policy.distribution.scale.min().item()
+        action_std_max = self.policy.distribution.scale.max().item()
+        obs_min_item = obs_min.item() if obs_min is not None else 0.0
+        obs_max_item = obs_max.item() if obs_max is not None else 0.0
+        obs_norm_min_item = obs_norm_min.item() if obs_norm_min is not None else 0.0
+        obs_norm_max_item = obs_norm_max.item() if obs_norm_max is not None else 0.0
+
+        action_min = self.storage.actions.min()
+        action_max = self.storage.actions.max()
+        action_mean = self.storage.actions.mean()
+
         # Construct the loss dictionary
         loss_dict = {
             # Core losses
-            "value": mean_value_loss,
-            "surrogate": mean_surrogate_loss,
-            "entropy": mean_entropy,
+            "loss/value": mean_value_loss,
+            "loss/surrogate": mean_surrogate_loss,
+            "policy/entropy": mean_entropy,
             
             # KL/clipping metrics
-            "kl_divergence": mean_kl_divergence,
-            "clip_frac": mean_clip_frac,
+            "policy/kl_divergence": mean_kl_divergence,
+            "policy/kl_exceed_frac": mean_kl_exceed_frac,
+            "policy/kl_std": mean_kl_std,
+            "policy/kl_max": mean_kl_max,
+            "policy/clip_frac": mean_clip_frac,
             
             # Value/return statistics
-            "Train/returns_mean": returns_mean,
-            "Train/returns_std": returns_std,
-            "Train/returns_min": returns_min,
-            "Train/returns_max": returns_max,
-            "Train/clean_returns_mean": clean_returns_mean,
-            "Train/clean_returns_std": clean_returns_std,
-            "Train/clean_returns_min": clean_returns_min,
-            "Train/clean_returns_max": clean_returns_max,
-            "Train/advantages_mean": advantages_mean,
-            "Train/advantages_std": advantages_std,
-            "Train/value_pred_error": mean_value_pred_error,
+            "value/returns_mean": returns_mean,
+            "value/returns_std": returns_std,
+            "value/returns_min": returns_min,
+            "value/returns_max": returns_max,
+            "value/clean_returns_mean": clean_returns_mean,
+            "value/clean_returns_std": clean_returns_std,
+            "value/clean_returns_min": clean_returns_min,
+            "value/clean_returns_max": clean_returns_max,
+            "value/advantages_mean": advantages_mean,
+            "value/advantages_std": advantages_std,
+            "value/pred_error": mean_value_pred_error,
+            "value/pred_std": mean_value_pred_std,
+            "value/q_std": mean_value_q_std,
+            "optim/learning_rate": self.learning_rate,
             
             # Reward statistics
-            "Train/rewards_mean": rewards_mean,
-            "Train/rewards_std": rewards_std,
+            "env/rewards_mean": rewards_mean,
+            "env/rewards_std": rewards_std,
+            "env/double_terminations": num_double_terminations,
+            "env/obs_min": obs_min_item,
+            "env/obs_max": obs_max_item,
+            "env/obs_norm_min": obs_norm_min_item,
+            "env/obs_norm_max": obs_norm_max_item,
             
             # Termination statistics
-            "Train/num_true_terminations": num_true_terminations,
-            "Train/num_truncations": num_truncations,
-            "Train/num_orphan_truncations": num_orphan_truncations,
+            "env/true_terminations": num_true_terminations,
+            "env/truncations": num_truncations,
+            "env/orphan_truncations": num_orphan_truncations,
             
             # Gradient/ratio statistics
-            "Train/grad_norm": mean_grad_norm,
-            "Train/ratio_std": mean_ratio_std,
-            "Train/advantage_std_minibatch": mean_advantage_std,
+            "optim/grad_norm": mean_grad_norm,
+            "policy/ratio_std": mean_ratio_std,
+            "value/advantage_std_minibatch": mean_advantage_std,
             
             # Policy distribution statistics
-            "Policy/action_std_mean": mean_action_std_mean,
+            "policy/action_std_mean": mean_action_std_mean,
+            "policy/action_std_min": action_std_min,
+            "policy/action_std_max": action_std_max,
+            "policy/action_mean_abs": mean_action_mean_abs,
+            "policy/action_min": action_min,
+            "policy/action_max": action_max,
+            "policy/action_mean": action_mean,
         }
         if self.rnd:
-            loss_dict["rnd"] = mean_rnd_loss
+            loss_dict["aux/rnd_loss"] = mean_rnd_loss
         if self.symmetry:
-            loss_dict["symmetry"] = mean_symmetry_loss
+            loss_dict["aux/symmetry_loss"] = mean_symmetry_loss
 
         return loss_dict
 

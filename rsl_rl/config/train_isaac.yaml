@@ -1,5 +1,5 @@
 defaults:
-  - runner: ppo
+  - runner: reppo
   - _self_
 
 # Device used by the runner/algorithm.
@@ -23,20 +23,18 @@ export_map_location: null
 
 # If null, defaults to `runner.max_iterations`.
 num_learning_iterations: null
-init_at_random_ep_len: false
+seed: 1
 
 # Environment factory.
 # Provide a callable string in the form `module:attribute`, returning a `rsl_rl.env.VecEnv`.
 # Example (external repo): env.make: legged_gym.utils.task_registry:make_env
 env:
-  make: rsl_rl.train_isaac:make_isaaclab_vec_env
+  make: rsl_rl.train_isaac:make_reppo_isaac_env
   kwargs:
     task_name: Isaac-Velocity-Rough-H1-v0
     num_envs: 4096
-    headless: true
-    show_cfg: true
-    wrapper: isaaclab
-    verbose: false
+    device: cuda
+    seed: ${seed}
 
 hydra:
   job:

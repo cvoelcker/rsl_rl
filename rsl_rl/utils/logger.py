@@ -41,8 +41,8 @@ class Logger:
 
         # Create buffers
         self.ep_extras = []
-        self.rewbuffer = deque(maxlen=100)
-        self.lenbuffer = deque(maxlen=100)
+        self.rewbuffer = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.lenbuffer = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
@@ -92,11 +92,8 @@ class Logger:
 
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
-            # if len(new_ids) > 0:
-            #     print(f"terminated with lengths {self.cur_episode_length[new_ids][:, 0].mean()} and rewards {self.cur_reward_sum[new_ids][:, 0].mean()}, with current max length {self.cur_episode_length.max()} and max reward {self.cur_reward_sum.max()}")
-            #     print(f"Max reset length was {self.cur_episode_length[new_ids][:, 0].max()} and reward {self.cur_reward_sum[new_ids][:, 0].max()}")
-            self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-            self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+            self.rewbuffer[new_ids[:, 0]] = self.cur_reward_sum[new_ids][:, 0]
+            self.lenbuffer[new_ids[:, 0]] = self.cur_episode_length[new_ids][:, 0]
             self.cur_reward_sum[new_ids] = 0
             self.cur_episode_length[new_ids] = 0
             if intrinsic_rewards is not None:
@@ -104,6 +101,11 @@ class Logger:
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
+
+    def update_episode_lengths(self, env_steps: torch.Tensor) -> None:
+        """Update the episode lengths buffer after each environment step."""
+        self.cur_episode_length = torch.zeros_like(self.cur_episode_length)
+
 
     def log(
         self,
@@ -196,14 +198,14 @@ class Logger:
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     if "Rnd/weight" in loss_dict:
                         pass  # Already logged above
-                self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
-                self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
+                self.writer.add_scalar("Train/mean_reward", torch.mean(self.rewbuffer).cpu().item(), it)
+                self.writer.add_scalar("Train/mean_episode_length", torch.mean(self.lenbuffer).cpu().item(), it)
                 if self.logger_type != "wandb":
                     self.writer.add_scalar(
-                        "Train/mean_reward/time", statistics.mean(self.rewbuffer), int(self.tot_time)
+                        "Train/mean_reward/time", torch.mean(self.rewbuffer).cpu().item(), int(self.tot_time)
                     )
                     self.writer.add_scalar(
-                        "Train/mean_episode_length/time", statistics.mean(self.lenbuffer), int(self.tot_time)
+                        "Train/mean_episode_length/time", torch.mean(self.lenbuffer).cpu().item(), int(self.tot_time)
                     )
 
             # Print to console
@@ -233,10 +235,10 @@ class Logger:
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
                 if self.cfg["algorithm"]["rnd_cfg"]:
-                    log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
-                    log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
-                log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
-                log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
+                    log_string += f"""{"Mean extrinsic reward:":>{pad}} {torch.mean(self.erewbuffer).cpu().item():.2f}\n"""
+                    log_string += f"""{"Mean intrinsic reward:":>{pad}} {torch.mean(self.irewbuffer).cpu().item():.2f}\n"""
+                log_string += f"""{"Mean reward:":>{pad}} {torch.mean(self.rewbuffer).cpu().item():.2f}\n"""
+                log_string += f"""{"Mean episode length:":>{pad}} {torch.mean(self.lenbuffer).cpu().item():.2f}\n"""
 
             # Print episode extras
             if not print_minimal:
@@ -256,6 +258,14 @@ class Logger:
 
             # Clear extras buffer
             self.ep_extras.clear()
+
+    def log_eval(self, it: int, eval_metrics: dict) -> None:
+        """Log evaluation metrics to the logging service."""
+        if self.log_dir is not None and not self.disable_logs:
+            for key, value in eval_metrics.items():
+                if value is None:
+                    continue
+                self.writer.add_scalar(f"Eval/{key}", value, it)
 
     def save_model(self, path: str, it: int) -> None:
         """Save the model to external logging services if specified."""

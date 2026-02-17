@@ -41,8 +41,12 @@ class ActorQCNN(ActorQ):
         distribution_type: str = "normal",
         init_alpha_temp: float = 0.1,
         init_alpha_kl: float = 0.1,
+        init_alpha_mean: float = 0.1,
+        action_scale: float | torch.Tensor = 1.0,
         **kwargs: dict[str, Any],
     ) -> None:
+        action_low: float | torch.Tensor | None = None,
+        action_high: float | torch.Tensor | None = None,
         if kwargs:
             print("ActorQCNN.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs]))
         super(ActorQ, self).__init__()
@@ -223,10 +227,24 @@ class ActorQCNN(ActorQ):
         # Note: Populated in update_distribution
         self.num_actions = num_actions
         self.distribution = None
+        if action_low is not None or action_high is not None:
+            if action_low is None or action_high is None:
+                raise ValueError("Both action_low and action_high must be provided")
+            action_low_t = torch.as_tensor(action_low, dtype=torch.get_default_dtype())
+            action_high_t = torch.as_tensor(action_high, dtype=torch.get_default_dtype())
+            action_scale_t = (action_high_t - action_low_t) / 2.0
+        else:
+            action_low_t = None
+            action_high_t = None
+            action_scale_t = torch.as_tensor(action_scale, dtype=torch.get_default_dtype())
+        self.register_buffer("action_low", action_low_t)
+        self.register_buffer("action_high", action_high_t)
+        self.register_buffer("action_scale", action_scale_t)
 
         # Trainable temperature parameters
         self.log_alpha_temp = nn.Parameter(torch.log(torch.tensor(init_alpha_temp)))
         self.log_alpha_kl = nn.Parameter(torch.log(torch.tensor(init_alpha_kl)))
+        self.log_alpha_mean = nn.Parameter(torch.log(torch.tensor(init_alpha_mean)))
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -238,6 +256,10 @@ class ActorQCNN(ActorQ):
     @property
     def alpha_kl(self) -> torch.Tensor:
         return self.log_alpha_kl.exp()
+
+    @property
+    def alpha_mean(self) -> torch.Tensor:
+        return self.log_alpha_mean.exp()
 
     def _update_distribution(self, mlp_obs: torch.Tensor, cnn_obs: dict[str, torch.Tensor]) -> None:
         if self.actor_cnns is not None:
@@ -271,7 +293,10 @@ class ActorQCNN(ActorQ):
         if self.distribution_type == "normal":
             self.distribution = Normal(mean, std)
         elif self.distribution_type == "tanh":
-            self.distribution = TanhNormal(mean, std)
+            if self.action_low is not None:
+                self.distribution = TanhNormal(mean, std, action_low=self.action_low, action_high=self.action_high)
+            else:
+                self.distribution = TanhNormal(mean, std, action_scale=self.action_scale)
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         mlp_obs, cnn_obs = self.get_actor_obs(obs)

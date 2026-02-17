@@ -15,6 +15,7 @@ from typing import Any, NoReturn
 from rsl_rl.networks import MLP, EmpiricalNormalization, TanhNormal
 from rsl_rl.networks.sem import SimplicalEmbeddingModule
 from rsl_rl.utils.hl_gauss import HLGaussLayer, embed_targets
+from rsl_rl.utils.utils import resolve_nn_activation
 
 
 class ActorQ(nn.Module):
@@ -40,8 +41,14 @@ class ActorQ(nn.Module):
         distribution_type: str = "tanh",
         init_alpha_temp: float = 0.1,
         init_alpha_kl: float = 0.1,
+        init_alpha_mean: float = 0.1,
         add_sem: bool = False,
         add_layer_norm: bool = False,
+        sigmoid_mult: float = 1.0,
+        mean_mult: float = 1.0,
+        action_scale: float | torch.Tensor = 1.0,
+        action_low: float | torch.Tensor | None = None,
+        action_high: float | torch.Tensor | None = None,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -82,21 +89,24 @@ class ActorQ(nn.Module):
             raise ValueError(f"Unknown distribution type: {self.distribution_type}. Should be 'normal' or 'tanh'.")
 
         # Critic
+        activation_mod = resolve_nn_activation(activation)
         self.num_critic_bins = num_critic_bins
         self.vmin = vmin
         self.vmax = vmax
-        self.critic = MLP(num_critic_obs, critic_hidden_dims[-1], critic_hidden_dims[:-1], activation, last_activation=activation, add_sem=False, use_layer_norm=add_layer_norm)
+        self.critic = MLP(num_critic_obs, critic_hidden_dims[-1], critic_hidden_dims[:-1], activation, last_activation=None, add_sem=False, use_layer_norm=add_layer_norm)
         match (add_sem, add_layer_norm):
             case (True, False):
                 self.critic_embedding_norm = nn.Sequential(
-                    SimplicalEmbeddingModule(embed_dim=critic_hidden_dims[-1], chunk_size=16)
+                    SimplicalEmbeddingModule(embed_dim=critic_hidden_dims[-1], chunk_size=16),
+                    activation_mod(),
                 )
             case (False, True):
                 self.critic_embedding_norm = nn.Sequential(
-                    nn.LayerNorm(critic_hidden_dims[-1])
+                    nn.RMSNorm(critic_hidden_dims[-1]),
+                    activation_mod(),
                 )
             case (False, False):
-                self.critic_embedding_norm = nn.Identity()
+                self.critic_embedding_norm = activation_mod()
             case (True, True):
                 raise ValueError("Cannot use both SEM and LayerNorm in the critic.")
 
@@ -106,7 +116,7 @@ class ActorQ(nn.Module):
             max_value=vmax,
             num_bins=num_critic_bins,
             sigma=0.75,
-            offset_mult=40.0,
+            offset_mult=0.0,
         )
         print(f"Critic MLP: {self.critic}")
 
@@ -120,19 +130,28 @@ class ActorQ(nn.Module):
         # Action noise
         self.noise_std_type = noise_std_type
         if self.state_dependent_std:
-            torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
-            if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
-            elif self.noise_std_type == "log":
-                torch.nn.init.constant_(
-                    self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
-                )
-            elif self.noise_std_type == "sigmoid":
-                torch.nn.init.constant_(
-                    self.actor[-2].bias[num_actions:], -torch.log(torch.tensor((1.0 / init_noise_std) - 1.0) + 1e-7)
-                )
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            pass
+            # torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
+            # if self.noise_std_type == "scalar":
+            #     inverse_softplus = torch.log(torch.exp(torch.tensor(init_noise_std)) - 1.0)
+            #     torch.nn.init.constant_(self.actor[-2].bias[num_actions:], inverse_softplus)
+            # elif self.noise_std_type == "log":
+            #     torch.nn.init.constant_(
+            #         self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
+            #     )
+            # elif self.noise_std_type == "sigmoid":
+            #     torch.nn.init.constant_(
+            #         self.actor[-2].bias[num_actions:], -torch.log(torch.tensor((1.0 / init_noise_std) - 1.0) + 1e-7)
+            #     )
+            # elif self.noise_std_type == "softsign":
+            #     # softsign inverse
+            #     inverse_softsign = init_noise_std / (1.0 - init_noise_std)
+            #     torch.nn.init.constant_(
+            #         self.actor[-2].bias[num_actions:], inverse_softsign
+            #     )
+            # else:
+            #     raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            # pass
         else:
             if self.noise_std_type == "scalar":
                 self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -140,8 +159,29 @@ class ActorQ(nn.Module):
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
             elif self.noise_std_type == "sigmoid":
                 self.log_std = nn.Parameter(torch.logit((init_noise_std - 1e-4) * torch.ones(num_actions)))
+            elif self.noise_std_type == "softsign":
+                # softsign inverse
+                inverse_softsign = init_noise_std / (1.0 - init_noise_std)
+                self.log_std = nn.Parameter(inverse_softsign * torch.ones(num_actions))
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        self.sigmoid_mult = sigmoid_mult
+        if action_low is not None or action_high is not None:
+            if action_low is None or action_high is None:
+                raise ValueError("Both action_low and action_high must be provided")
+            action_low_t = torch.as_tensor(action_low, dtype=torch.get_default_dtype())
+            action_high_t = torch.as_tensor(action_high, dtype=torch.get_default_dtype())
+            action_scale_t = (action_high_t - action_low_t) / 2.0
+            action_bias_t = (action_high_t + action_low_t) / 2.0
+        else:
+            action_scale_t = torch.as_tensor(action_scale, dtype=torch.get_default_dtype())
+            action_bias_t = torch.zeros_like(action_scale_t)
+        self.register_buffer("action_low", action_low_t if action_low is not None else None)
+        self.register_buffer("action_high", action_high_t if action_high is not None else None)
+        self.register_buffer("action_scale", action_scale_t)
+        self.register_buffer("action_bias", action_bias_t)
+        self.register_buffer("mean_mult", 1.0 / action_scale_t)
+        self.register_buffer("mean_bias", -action_bias_t / action_scale_t)
 
         # Action distribution
         # Note: Populated in update_distribution
@@ -151,12 +191,12 @@ class ActorQ(nn.Module):
         # Trainable temperature parameters
         self.log_alpha_temp = nn.Parameter(torch.log(torch.tensor(init_alpha_temp)))
         self.log_alpha_kl = nn.Parameter(torch.log(torch.tensor(init_alpha_kl)))
+        self.log_alpha_mean = nn.Parameter(torch.log(torch.tensor(init_alpha_mean)))
 
         # set magic 0 embedding
         self.norm = nn.LayerNorm(critic_hidden_dims[-1])
 
         self.min_noise_std = min_noise_std
-
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
 
@@ -178,6 +218,10 @@ class ActorQ(nn.Module):
     @property
     def alpha_kl(self) -> torch.Tensor:
         return self.log_alpha_kl.exp()
+
+    @property
+    def alpha_mean(self) -> torch.Tensor:
+        return self.log_alpha_mean.exp()
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -201,46 +245,51 @@ class ActorQ(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _update_distribution(self, obs: torch.Tensor, mean=None, std=None) -> None:
-        if mean is None or std is None:
-            if self.state_dependent_std:
-                # Compute mean and standard deviation
-                mean_and_std = self.actor(obs)
-                if self.noise_std_type == "scalar":
-                    mean, std = torch.unbind(mean_and_std, dim=-2)
-                    std = torch.nn.functional.softplus(std)
-                elif self.noise_std_type == "log":
-                    mean, log_std = torch.unbind(mean_and_std, dim=-2)
-                    std = torch.exp(log_std)
-                elif self.noise_std_type == "sigmoid":
-                    mean, logit_std = torch.unbind(mean_and_std, dim=-2)
-                    std = torch.sigmoid(logit_std)
-                else:
-                    raise ValueError(
-                        f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
-                    )
+    def _update_distribution(self, obs: torch.Tensor) -> None:
+        if self.state_dependent_std:
+            # Compute mean and standard deviation
+            mean_and_std = self.actor(obs)
+            mean, std = torch.unbind(mean_and_std, dim=-2)
+            if self.noise_std_type == "scalar":
+                std = torch.nn.functional.softplus(std)
+            elif self.noise_std_type == "log":
+                std = torch.exp(std)
+            elif self.noise_std_type == "sigmoid":
+                std = torch.sigmoid(std)
+                std = std * self.sigmoid_mult
+            elif self.noise_std_type == "softsign":
+                std = torch.abs(std) / (1.0 + torch.abs(std))
             else:
-                # Compute mean
-                mean = self.actor(obs)
-                # Compute standard deviation
-                if self.noise_std_type == "scalar":
-                    std = self.std.expand_as(mean)
-                elif self.noise_std_type == "log":
-                    std = torch.exp(self.log_std).expand_as(mean)
-                elif self.noise_std_type == "sigmoid":
-                    std = torch.sigmoid(self.log_std).expand_as(mean)
-                else:
-                    raise ValueError(
-                        f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
-                    )
-            mean = mean
-            std = std + self.min_noise_std
-        
+                raise ValueError(
+                    f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
+                )
+        else:
+            # Compute mean
+            mean = self.actor(obs)
+            # Compute standard deviation
+            if self.noise_std_type == "scalar":
+                std = self.std.expand_as(mean)
+            elif self.noise_std_type == "log":
+                std = torch.exp(self.log_std).expand_as(mean)
+            elif self.noise_std_type == "sigmoid":
+                std = torch.sigmoid(self.log_std).expand_as(mean)
+                std = std * self.sigmoid_mult
+            elif self.noise_std_type == "softsign":
+                std = torch.abs(self.log_std).expand_as(mean) / (1.0 + torch.abs(self.log_std).expand_as(mean))
+            else:
+                raise ValueError(
+                    f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'"
+                )
+        std = (std + self.min_noise_std) * self.mean_mult
+        mean = mean * self.mean_mult # + self.mean_bias
         # Create distribution
         if self.distribution_type == "normal":
             self.distribution = Normal(mean, std)
         elif self.distribution_type == "tanh":
-            self.distribution = TanhNormal(mean, std)
+            if self.action_low is not None:
+                self.distribution = TanhNormal(mean, std, action_low=self.action_low, action_high=self.action_high)
+            else:
+                self.distribution = TanhNormal(mean, std, action_scale=self.action_scale)
 
     def act(self, obs: TensorDict, *args, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
@@ -251,10 +300,11 @@ class ActorQ(nn.Module):
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
+        self._update_distribution(obs)
         if self.state_dependent_std:
-            return self.actor(obs)[..., 0, :]
+            return self.distribution.mean
         else:
-            return self.actor(obs)
+            return self.distribution.mean
 
     def evaluate(self, obs: TensorDict, act: Tensor, *args, return_logits: bool = False) -> torch.Tensor:
         obs = self.get_critic_obs(obs)

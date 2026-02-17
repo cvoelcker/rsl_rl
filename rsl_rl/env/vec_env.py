@@ -201,5 +201,12 @@ class SkrlIsaacLabVecEnv(VecEnv):
             extras["info"] = info
 
         extras["time_outs"] = truncated
+        extras["terminations"] = terminated
 
         return self._to_obs_tensordict(obs), rewards, dones, extras
+    
+    def reset(self) -> TensorDict:
+        obs, _info = self._env.reset()
+        self.episode_length_buf.zero_()
+        self._obs = obs
+        return self._to_obs_tensordict(obs)

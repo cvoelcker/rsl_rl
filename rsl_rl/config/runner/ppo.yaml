@@ -7,10 +7,12 @@ max_iterations: 2000
 seed: 1
 
 # Observations
-obs_groups: {policy: [policy], critic: [critic]}
+obs_groups: {policy: [policy], critic: [policy]}
+init_at_random_ep_len: True
 
 # Logging
 save_interval: 50
+eval_interval: 200
 experiment_name: h1_rough
 run_name: ppo
 logger: wandb  # tensorboard, neptune, wandb
@@ -20,20 +22,20 @@ wandb_project: legged_gym
 policy:
   class_name: ActorCritic
   activation: elu
-  actor_obs_normalization: false
-  critic_obs_normalization: false
+  actor_obs_normalization: true
+  critic_obs_normalization: true
   actor_hidden_dims: [256, 256, 256]
   critic_hidden_dims: [256, 256, 256]
   init_noise_std: 1.0
   noise_std_type: scalar  # scalar or log
   state_dependent_std: false
-  distribution_type: tanh  # normal or ta
+  distribution_type: normal  # normal or ta
 
 algorithm:
   class_name: PPO
   learning_rate: 0.001
-  num_learning_epochs: 5
-  num_mini_batches: 4
+  num_learning_epochs: 4
+  num_mini_batches: 8
   schedule: adaptive
   value_loss_coef: 1.0
   clip_param: 0.2

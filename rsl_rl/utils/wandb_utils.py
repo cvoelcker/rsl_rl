@@ -42,10 +42,13 @@ class WandbSummaryWriter(SummaryWriter):
         wandb.config.update({"runner_cfg": train_cfg})
         wandb.config.update({"policy_cfg": train_cfg["policy"]})
         wandb.config.update({"alg_cfg": train_cfg["algorithm"]})
-        try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})
-        except Exception:
-            wandb.config.update({"env_cfg": asdict(env_cfg)})
+        if isinstance(env_cfg, dict):
+            wandb.config.update({"env_cfg": env_cfg})
+        else:
+            try:
+                wandb.config.update({"env_cfg": env_cfg.to_dict()})
+            except Exception:
+                wandb.config.update({"env_cfg": asdict(env_cfg)})
 
     def add_scalar(
         self,

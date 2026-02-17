@@ -151,11 +151,12 @@ class RolloutStorage:
 
         termination = self.dones.flatten(0, 1)
         truncation = self.truncations.flatten(0, 1)
-        dones = termination & ~truncation
+        dones = termination
 
         # Mask out truncated transitions (they have invalid value targets)
         truncation_mask = ~self.truncations.flatten(0, 1).squeeze(-1).bool()
         valid_indices = torch.nonzero(truncation_mask, as_tuple=False).squeeze(-1)
+        # valid_indices = torch.ones_like(valid_indices)
         num_valid = valid_indices.shape[0]
 
         # Compute batch sizes based on valid transitions
@@ -169,6 +170,8 @@ class RolloutStorage:
             for i in range(num_mini_batches):
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
+                if i == num_mini_batches - 1:  # Last batch takes the rest
+                    stop = num_valid
                 batch_idx = shuffled_indices[start:stop]
 
                 # Create the mini-batch

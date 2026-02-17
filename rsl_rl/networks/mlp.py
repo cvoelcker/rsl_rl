@@ -113,13 +113,13 @@ class MLP(nn.Sequential):
         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
         if use_layer_norm:
             layers.append(nn.RMSNorm(hidden_dims_processed[0]))
-        layers.append(activation_mod)
+        layers.append(activation_mod())
 
         for layer_index in range(len(hidden_dims_processed) - 1):
             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
             if use_layer_norm:
                 layers.append(nn.RMSNorm(hidden_dims_processed[layer_index + 1]))
-            layers.append(activation_mod)
+            layers.append(activation_mod())
 
         if add_sem:
             layers.append(SimplicalEmbeddingModule(embed_dim=hidden_dims_processed[-1], chunk_size=16))
@@ -127,19 +127,19 @@ class MLP(nn.Sequential):
         # Add last layer
         total_out_dim = output_dim if isinstance(output_dim, int) else reduce(lambda x, y: x * y, output_dim)
         if isinstance(output_dim, int):
-            if use_layer_norm:
-                layers.append(nn.RMSNorm(hidden_dims_processed[-1]))
             layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
         else:
-            # Add a layer to reshape the output to the desired shape
-            if use_layer_norm:
-                layers.append(nn.RMSNorm(hidden_dims_processed[-1]))
-            layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
+            last_layer = nn.Linear(hidden_dims_processed[-1], total_out_dim)
+            # set small random orthogonal initialization
+            nn.init.orthogonal_(last_layer.weight, gain=0.01)
+            nn.init.zeros_(last_layer.bias)
+
+            layers.append(last_layer)
             layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
 
         # Add last activation function if specified
         if last_activation_mod is not None:
-            layers.append(last_activation_mod)
+            layers.append(last_activation_mod())
 
         # Register the layers
         for idx, layer in enumerate(layers):

@@ -9,9 +9,9 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from rsl_rl.env import VecEnv
-from rsl_rl.env.vec_env import SkrlIsaacLabVecEnv
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 from rsl_rl.utils import string_to_callable
+
 
 
 def make_isaaclab_vec_env(
@@ -30,6 +30,7 @@ def make_isaaclab_vec_env(
 
     Note: Isaac Lab itself must be installed and typically requires launching via `isaaclab -p ...`.
     """
+    from rsl_rl.env.vec_env import SkrlIsaacLabVecEnv
     try:
         from skrl.envs.loaders.torch import load_isaaclab_env
         from skrl.envs.wrappers.torch import wrap_env
@@ -46,6 +47,25 @@ def make_isaaclab_vec_env(
     )
     wrapped_env = wrap_env(base_env, wrapper=wrapper, verbose=verbose)
     return SkrlIsaacLabVecEnv(wrapped_env)
+
+def make_reppo_isaac_env(
+    task_name: str,
+    device: str,
+    num_envs: int,
+    seed: int,
+    action_bounds: float | None = None,
+) -> VecEnv:
+    """Create an Isaac Lab environment via the Reppo wrapper and adapt it to `rsl_rl.env.VecEnv`."""
+    from rsl_rl.env.reppo_env import IsaacLabEnv
+
+    env = IsaacLabEnv(
+        task_name=task_name,
+        device=device,
+        num_envs=num_envs,
+        seed=seed,
+        action_bounds=action_bounds,
+    )
+    return env
 
 
 def _resolve_device(device: str) -> str:
@@ -93,15 +113,7 @@ def _make_env(cfg: DictConfig) -> VecEnv:
         assert isinstance(kwargs, dict)
 
     env = make_fn(**kwargs)
-    if not isinstance(env, VecEnv):
-        # Many external envs implement VecEnv but don't subclass it directly; we still require the interface.
-        missing = [
-            name
-            for name in ("num_envs", "num_actions", "device", "cfg", "get_observations", "step")
-            if not hasattr(env, name)
-        ]
-        if missing:
-            raise TypeError(f"env.make returned an object that does not look like a VecEnv. Missing: {missing}")
+
     return env  # type: ignore[return-value]
 
 
@@ -138,6 +150,8 @@ def train(cfg: DictConfig, env: VecEnv | None = None) -> OnPolicyRunner | Distil
     log_dir = cfg.get("log_dir")
     log_dir = None if log_dir in (None, "null") else str(log_dir)
 
+    print(runner_cfg["algorithm"])
+
     runner = runner_cls(env=env, train_cfg=runner_cfg, log_dir=log_dir, device=device)
 
     # Resume if requested
@@ -151,9 +165,10 @@ def train(cfg: DictConfig, env: VecEnv | None = None) -> OnPolicyRunner | Distil
     else:
         num_learning_iterations = int(num_learning_iterations)
 
+
     runner.learn(
         num_learning_iterations=num_learning_iterations,
-        init_at_random_ep_len=bool(cfg.get("init_at_random_ep_len", False)),
+        init_at_random_ep_len=bool(runner_cfg.get("init_at_random_ep_len", False)),
     )
     return runner
 
@@ -164,6 +179,11 @@ def main(cfg: DictConfig) -> None:
 
     Config is loaded from `rsl_rl/config/train_isaac.yaml`.
     """
+
+    from isaaclab.app import AppLauncher
+
+    app_launcher = AppLauncher(headless=True)
+    simulation_app = app_launcher.app
     # Print resolved config for reproducibility
     print(OmegaConf.to_yaml(cfg, resolve=True))
     train(cfg)

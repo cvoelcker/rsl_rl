@@ -38,18 +38,18 @@ def resolve_nn_activation(act_name: str) -> torch.nn.Module:
         ValueError: If the activation function is not found.
     """
     act_dict = {
-        "elu": torch.nn.ELU(),
-        "selu": torch.nn.SELU(),
-        "relu": torch.nn.ReLU(),
-        "crelu": torch.nn.CELU(),
-        "lrelu": torch.nn.LeakyReLU(),
-        "tanh": torch.nn.Tanh(),
-        "sigmoid": torch.nn.Sigmoid(),
-        "softplus": torch.nn.Softplus(),
-        "gelu": torch.nn.GELU(),
-        "swish": torch.nn.SiLU(),
-        "mish": torch.nn.Mish(),
-        "identity": torch.nn.Identity(),
+        "elu": torch.nn.ELU,
+        "selu": torch.nn.SELU,
+        "relu": torch.nn.ReLU,
+        "crelu": torch.nn.CELU,
+        "lrelu": torch.nn.LeakyReLU,
+        "tanh": torch.nn.Tanh,
+        "sigmoid": torch.nn.Sigmoid,
+        "softplus": torch.nn.Softplus,
+        "gelu": torch.nn.GELU,
+        "swish": torch.nn.SiLU,
+        "mish": torch.nn.Mish,
+        "identity": torch.nn.Identity,
     }
 
     act_name = act_name.lower()

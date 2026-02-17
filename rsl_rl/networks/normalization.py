@@ -14,7 +14,7 @@ from torch import nn
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 
-    def __init__(self, shape: int | tuple[int] | list[int], eps: float = 1e-1, until: int | None = None) -> None:
+    def __init__(self, shape: int | tuple[int] | list[int], eps: float = 1e-2, until: int | None = None, gamma:float = 1.0-1e-7) -> None:
         """Initialize EmpiricalNormalization module.
 
         .. note:: The normalization parameters are computed over the whole batch, not for each environment separately.
@@ -27,6 +27,7 @@ class EmpiricalNormalization(nn.Module):
         super().__init__()
         self.eps = eps
         self.until = until
+        self.gamma = gamma
         self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0))
         self.register_buffer("_var", torch.ones(shape).unsqueeze(0))
         self.register_buffer("_std", torch.ones(shape).unsqueeze(0))
@@ -42,7 +43,7 @@ class EmpiricalNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize mean and variance of values based on empirical values."""
-        return (x - self._mean) / (self._std + self.eps)
+        return (x - self._mean) / torch.clamp(self._std, min=self.eps)
 
     @torch.jit.unused
     def update(self, x: torch.Tensor) -> None:
@@ -54,7 +55,7 @@ class EmpiricalNormalization(nn.Module):
 
         count_x = x.shape[0]
         self.count += count_x
-        rate = count_x / self.count
+        rate = min(count_x / self.count, 1 - self.gamma)
         var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
         mean_x = torch.mean(x, dim=0, keepdim=True)
         delta_mean = mean_x - self._mean
@@ -65,7 +66,7 @@ class EmpiricalNormalization(nn.Module):
     @torch.jit.unused
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """De-normalize values based on empirical values."""
-        return y * (self._std + self.eps) + self._mean
+        return y * torch.clamp(self._std, min=self.eps) + self._mean
 
 
 class EmpiricalDiscountedVariationNormalization(nn.Module):

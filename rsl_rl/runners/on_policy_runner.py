@@ -40,6 +40,9 @@ class OnPolicyRunner:
         self.device = device
         self.env = env
 
+        # Resolve action scaling configuration
+        self.action_scale_cfg = self._resolve_action_scale_config()
+
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
 
@@ -63,13 +66,12 @@ class OnPolicyRunner:
         )
 
         self.current_learning_iteration = 0
+        self.init_at_random_ep_len = self.cfg.get("init_at_random_ep_len", False)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
+            self.env.randomize_num_steps(self.env.max_episode_steps)  # randomize episode lengths after evaluation for better exploration
 
         # Start learning
         obs = self.env.get_observations().to(self.device)
@@ -83,40 +85,38 @@ class OnPolicyRunner:
         # Start training
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
+        it = 0
         for it in range(start_it, total_it):
             start = time.time()
             # Rollout
-            with torch.inference_mode():
-                for _ in range(self.cfg["num_steps_per_env"]):
-                    # Sample actions
+            for _ in range(self.cfg["num_steps_per_env"]):
+                # Sample actions
+                with torch.inference_mode():
                     actions = self.alg.act(obs)
                     # scale actions
-                    if self.alg_cfg.get("scale_actions", False):
-                        upper = self.alg_cfg.get("action_upper_bound", 1.0)
-                        lower = self.alg_cfg.get("action_lower_bound", -1.0)
-                        actions = actions * (upper - lower) / 2.0 + (upper + lower) / 2.0
+                    if self.action_scale_cfg["scale_actions"] and self.action_scale_cfg["method"] == "runner":
+                        actions = self._scale_actions(actions)
 
-                    # Step the environment
-                    # print("mean abs actions: ", actions.abs().mean())  # DEBUG
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    rewards = rewards.squeeze(-1)
-                    dones = dones.squeeze(-1)
-                    extras["time_outs"] = extras["time_outs"].squeeze(-1)
-                    # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg_cfg["rnd_cfg"] else None
-                    # Book keeping
-                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+                # Step the environment
+                obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                rewards = rewards.squeeze(-1)
+                dones = dones.squeeze(-1)
+                extras["time_outs"] = extras["time_outs"].squeeze(-1)
+                # Move to device
+                obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                # Process the step
+                self.alg.process_env_step(obs, rewards, dones, extras)
+                # Extract intrinsic rewards (only for logging)
+                intrinsic_rewards = self.alg.intrinsic_rewards if self.alg_cfg["rnd_cfg"] else None
+                # Book keeping
+                self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
 
-                stop = time.time()
-                collect_time = stop - start
-                start = stop
+            stop = time.time()
+            collect_time = stop - start
+            start = stop
 
-                # Compute returns
-                self.alg.compute_returns(obs)
+            # Compute returns
+            self.alg.compute_returns(obs)
 
             # Update policy
             loss_dict = self.alg.update()
@@ -138,8 +138,13 @@ class OnPolicyRunner:
             # Save model
             if it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+            
+            if it % self.cfg["eval_interval"] == 0:
+                self.eval(it)
+                obs = self.env.get_observations().to(self.device)
 
         # Save the final model after training
+        self.eval(it)
         if self.logger.log_dir is not None and not self.logger.disable_logs:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
@@ -174,6 +179,30 @@ class OnPolicyRunner:
         }
         save_policy_checkpoint(path, model_state_dict=self.alg.policy.state_dict(), metadata=metadata)
         self.logger.save_model(path, self.current_learning_iteration)
+
+    def eval(self, it: int):
+        """Run evaluation rollouts with the current policy."""
+        self.eval_mode()  # switch to eval mode (for dropout for example)
+        obs = self.env.reset().to(self.device)
+        done = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        returns = torch.zeros(self.env.num_envs, device=self.device)
+        lengths = torch.zeros(self.env.num_envs, device=self.device)
+        while not done.all():
+            with torch.inference_mode():
+                actions = self.alg.policy.act_inference(obs)
+            if self.action_scale_cfg["scale_actions"] and self.action_scale_cfg["method"] == "runner":
+                actions = self._scale_actions(actions)
+            obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+            obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+            done = done | dones.squeeze(-1)
+            # book keeping
+            returns += rewards.squeeze(-1) * (1.0 - done)  # only add rewards for environments that are not done
+            lengths += (1.0 - done)  # only add to length for environments that are not done
+        self.logger.log_eval(it, {"eval_return": returns.mean().item(), "eval_length": lengths.mean().item()})
+        if self.init_at_random_ep_len:
+            self.env.reset()  # reset the env after evaluation
+            self.env.randomize_num_steps(self.env.max_episode_steps)  # randomize episode lengths after evaluation for better exploration
+            self.logger.update_episode_lengths(self.env.episode_length_buf)
 
     def export_policy_jit(self, path: str, *, device: str = "cpu") -> None:
         """Export the policy as a TorchScript module (flat actor obs -> actions).
@@ -238,6 +267,59 @@ class OnPolicyRunner:
             default_sets.append("rnd_state")
         return default_sets
 
+    def _resolve_action_scale_config(self) -> dict[str, str | bool]:
+        scale_actions = bool(self.alg_cfg.get("scale_actions", False))
+        method = self.alg_cfg.get("action_scale_method")
+        bounds = self.alg_cfg.get("action_scale_bounds")
+
+        # Legacy compatibility
+        if method is None or bounds is None:
+            if self.alg_cfg.get("use_env_action_bounds_in_runner", False):
+                method = "runner"
+                bounds = "env"
+            elif self.alg_cfg.get("use_env_action_bounds", False):
+                method = "policy"
+                bounds = "env"
+            else:
+                method = method or "runner"
+                bounds = bounds or "provided"
+
+        if method not in ("runner", "policy"):
+            raise ValueError(f"Unknown action_scale_method '{method}'. Expected 'runner' or 'policy'.")
+        if bounds not in ("provided", "env"):
+            raise ValueError(f"Unknown action_scale_bounds '{bounds}'. Expected 'provided' or 'env'.")
+
+        self.alg_cfg["action_scale_method"] = method
+        self.alg_cfg["action_scale_bounds"] = bounds
+
+        return {"scale_actions": scale_actions, "method": method, "bounds": bounds}
+
+    def _resolve_action_bounds(self) -> tuple[torch.Tensor | float, torch.Tensor | float]:
+        if self.action_scale_cfg["bounds"] == "env":
+            if not (hasattr(self.env, "action_low") and hasattr(self.env, "action_high")):
+                raise ValueError("Environment does not provide action_low/action_high for action scaling.")
+            return self.env.action_low, self.env.action_high
+
+        lower = self.alg_cfg.get("action_lower_bound", -1.0)
+        upper = self.alg_cfg.get("action_upper_bound", 1.0)
+        return lower, upper
+
+    def _to_bound_tensor(
+        self, value: torch.Tensor | float | list, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device, dtype=dtype)
+        if isinstance(value, (list, tuple)):
+            tensor_value = torch.tensor(value, device=device, dtype=dtype)
+            return torch.sign(tensor_value) * torch.ceil(tensor_value.abs())
+        return torch.tensor(value, device=device, dtype=dtype)
+
+    def _scale_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        lower, upper = self._resolve_action_bounds()
+        lower_t = self._to_bound_tensor(lower, actions.device, actions.dtype)
+        upper_t = self._to_bound_tensor(upper, actions.device, actions.dtype)
+        return actions * (upper_t - lower_t) / 2.0 + (upper_t + lower_t) / 2.0
+
     def _configure_multi_gpu(self) -> None:
         """Configure multi-gpu training."""
         # Check if distributed training is enabled
@@ -301,6 +383,12 @@ class OnPolicyRunner:
                 self.policy_cfg["actor_obs_normalization"] = self.cfg["empirical_normalization"]
             if self.policy_cfg.get("critic_obs_normalization") is None:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
+
+        # Propagate action bounds to policy when scaling is handled by the policy
+        if self.action_scale_cfg["scale_actions"] and self.action_scale_cfg["method"] == "policy":
+            action_low, action_high = self._resolve_action_bounds()
+            self.policy_cfg["action_low"] = action_low
+            self.policy_cfg["action_high"] = action_high
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))

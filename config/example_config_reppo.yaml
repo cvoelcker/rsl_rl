@@ -49,6 +49,12 @@ runner:
     gamma: 0.99
     lam: 0.95
     max_grad_norm: 1.0
+    # Action scaling
+    scale_actions: false
+    action_scale_method: runner  # runner or policy
+    action_scale_bounds: provided  # provided or env
+    action_lower_bound: -1.0
+    action_upper_bound: 1.0
 
     # Random network distillation
     rnd_cfg:
