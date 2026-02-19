@@ -63,7 +63,8 @@ We have provided some simple utilities for scaling the tanh Gaussian between arb
 This can be accomplished by setting the action lower and upper bounds in the actor.
 We have found that scaling the actions in the actor instead of scaling them in the environment wrapper leads to more stable training.
 
-It is also possible to use a non-squashed Normal distribution, but in this case, the std deviation of the actor plicy needs to be constrained.
+It is also possible to use a non-squashed Normal distribution. In this case, the initial temperature alpha needs to be set lower to prevent the entropy bonus term from diverging.
+In addition, the reward is tuned for significantly smaller step sizes, as the standard RSL-RL PPO implementation constrains the KL deiation per update iteration to 0.01. Setting the desired_kl parameter for REPPO to this value can stabilize learning, especially when using non-squashed distributions.
 
 Finally, we observed that the curricula used in some Isaac environments have a strong influence on REPPO performance. In general, REPPO learns a strong policy much faster than PPO, but struggles to adapt to the distribution shift introduced by the curriculum.
 
