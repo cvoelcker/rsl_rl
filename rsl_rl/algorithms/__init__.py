@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .ppo import PPO
 from .reppo import REPPO
+from .reppo_hybrid import REPPO as REPPOHybrid
 
-__all__ = ["PPO", "REPPO", "Distillation"]
+__all__ = ["PPO", "REPPO", "Distillation", "REPPOHybrid"]

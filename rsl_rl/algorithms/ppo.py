@@ -47,6 +47,7 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        **kwargs
     ) -> None:
         # Device-related parameters
         self.device = device

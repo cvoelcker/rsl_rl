@@ -12,7 +12,7 @@ from torch import nn
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import PPO, REPPO
+from rsl_rl.algorithms import PPO, REPPO, REPPOHybrid
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -24,7 +24,7 @@ from rsl_rl.modules import (
     resolve_rnd_config,
     resolve_symmetry_config,
 )
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import RolloutStorage, HybridRolloutStorage
 from rsl_rl.utils import resolve_obs_groups
 from rsl_rl.utils.policy_export import export_policy_as_torchscript, save_policy_checkpoint
 from rsl_rl.utils.logger import Logger
@@ -269,8 +269,8 @@ class OnPolicyRunner:
 
     def _resolve_action_scale_config(self) -> dict[str, str | bool]:
         scale_actions = bool(self.alg_cfg.get("scale_actions", False))
-        method = self.alg_cfg.get("action_scale_method")
-        bounds = self.alg_cfg.get("action_scale_bounds")
+        method = self.alg_cfg.get("action_scale_method", None)
+        bounds = self.alg_cfg.get("action_scale_bounds", None)
 
         # Legacy compatibility
         if method is None or bounds is None:
@@ -397,9 +397,20 @@ class OnPolicyRunner:
         ).to(self.device)
 
         # Initialize the storage
-        storage = RolloutStorage(
-            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
-        )
+        if self.alg_cfg.get("off_policy", False):
+            storage = HybridRolloutStorage(
+                self.env.num_envs,
+                self.cfg["num_steps_per_env"],
+                self.env.num_envs * 5,
+                obs,
+                [self.env.num_actions],
+                self.device,
+            )
+            assert self.alg_cfg["class_name"] == "REPPOHybrid", "Off-policy storage is only compatible with REPPOHybrid algorithm."
+        else:
+            storage = RolloutStorage(
+                "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+            )
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))

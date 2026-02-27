@@ -15,7 +15,10 @@ from tensordict import TensorDict
 from rsl_rl.modules import ActorCriticRecurrent, ActorQ, ActorQCNN, ActorQRecurrent
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, Transition
+from rsl_rl.storage.rollout_storage import HybridRolloutStorage
 from rsl_rl.utils import string_to_callable
+
+from time import time
 
 
 class REPPO:
@@ -27,7 +30,7 @@ class REPPO:
     def __init__(
         self,
         policy: ActorQ | ActorQCNN | ActorQRecurrent,
-        storage: RolloutStorage,
+        storage: HybridRolloutStorage,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         gamma: float = 0.99,
@@ -50,6 +53,7 @@ class REPPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         actor_lr_multiplier: float = 1.0,
+        max_inf_batch_size: int = 81920,
         **kwargs,
     ) -> None:
         # Device-related parameters
@@ -149,6 +153,7 @@ class REPPO:
         self.num_kl_samples = num_kl_samples
 
         self.use_relative_kl = use_relative_kl
+        self.max_inf_batch_size = max_inf_batch_size
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -179,39 +184,69 @@ class REPPO:
 
         if self.rnd:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
-            self.transition.rewards += self.intrinsic_rewards
-
-        # compute entropy-regularized rewards
-        with torch.no_grad():
-            next_actions = self.policy.act(obs).detach()
-            next_actions_log_prob = (
-                self.policy.distribution.log_prob(next_actions).sum(-1).detach()
-            )
-        self.transition.next_actions_log_prob = next_actions_log_prob
-
-        log_probs = self.gamma * self.policy.alpha_temp.detach() * next_actions_log_prob
-        entropy_bonus = -log_probs
-
-        if self.use_relative_kl:
-            std = self.policy.distribution.scale
-            target_std = self.target_entropy
-            entropy_bonus = - self.policy.alpha_temp.detach() * (torch.log(target_std / std) + (std ** 2) / (2 * target_std ** 2) - 0.5).mean(-1).detach()
-        self.transition.soft_rewards = self.transition.rewards + (1.0 - self.transition.dones * 1.0).squeeze() * entropy_bonus
-
+ 
         # Record the transition
         self.storage.add_transition(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
 
+    def process_buffer_transitions(self) -> None:
+        # compute effective batches from rollout length
+        self.storage.select_for_off_policy_storage()
+        with torch.no_grad():
+            transition_batch_size = self.max_inf_batch_size // self.storage.num_transitions_per_env
+            num_op_transition_batches = self.storage.rollout_storage.num_envs // transition_batch_size
+            num_offp_transition_batches = self.storage.off_policy_storage.max_filled_index // transition_batch_size
+
+            for op_batch_idx in range(num_op_transition_batches):
+                obs = self.storage.rollout_storage.observations[:, op_batch_idx * transition_batch_size:(op_batch_idx + 1) * transition_batch_size]
+                rewards = self.storage.rollout_storage.rewards[:, op_batch_idx * transition_batch_size:(op_batch_idx + 1) * transition_batch_size]
+                dones = self.storage.rollout_storage.dones[:, op_batch_idx * transition_batch_size:(op_batch_idx + 1) * transition_batch_size]
+                truncations = self.storage.rollout_storage.truncations[:, op_batch_idx * transition_batch_size:(op_batch_idx + 1) * transition_batch_size]
+
+                self.policy.act(obs)
+                op_actions = self.policy.distribution.sample().detach()
+                # evaluate/log_prob return [T, B]; unsqueeze to [T, B, 1] to match storage shape
+                op_log_prob = self.policy.distribution.log_prob(op_actions).sum(-1).unsqueeze(-1).detach()
+                returns = self.policy.evaluate(obs, op_actions).unsqueeze(-1).detach()
+                rewards = rewards + truncations * self.gamma * returns
+                soft_rewards = rewards - (1.0 - dones) * self.policy.alpha_temp.detach() * op_log_prob
+                self.storage.rollout_storage.soft_rewards[:, op_batch_idx * transition_batch_size:(op_batch_idx + 1) * transition_batch_size] = soft_rewards
+                self.storage.rollout_storage.values[:, op_batch_idx * transition_batch_size:(op_batch_idx + 1) * transition_batch_size] = returns
+
+            num_offp_filled = self.storage.off_policy_storage.max_filled_index
+            num_offp_transition_batches = (num_offp_filled + transition_batch_size - 1) // transition_batch_size
+            for offp_batch_idx in range(num_offp_transition_batches):
+                offp_obs = self.storage.off_policy_storage.observations[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size]
+                offp_rewards = self.storage.off_policy_storage.rewards[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size]
+                offp_dones = self.storage.off_policy_storage.dones[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size]
+                offp_truncations = self.storage.off_policy_storage.truncations[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size]
+                offp_actions = self.storage.off_policy_storage.actions[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size]
+
+                self.policy.act(offp_obs)
+                offp_actions = self.policy.distribution.sample().detach()
+                offp_log_prob = self.policy.distribution.log_prob(offp_actions).sum(-1).unsqueeze(-1).detach()
+                offp_returns = self.policy.evaluate(offp_obs, offp_actions).unsqueeze(-1).detach()
+                offp_rewards = offp_rewards + offp_truncations * self.gamma * offp_returns
+                offp_soft_rewards = offp_rewards - (1.0 - offp_dones) * self.policy.alpha_temp.detach() * offp_log_prob
+                self.storage.off_policy_storage.soft_rewards[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size] = offp_soft_rewards
+                self.storage.off_policy_storage.values[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size] = offp_returns
+                curr_log_prob = self.policy.distribution.log_prob(offp_actions).sum(-1, keepdim=True).detach()
+                self.storage.off_policy_storage.curr_log_prob[:, offp_batch_idx * transition_batch_size:(offp_batch_idx + 1) * transition_batch_size] = curr_log_prob
+
+            self.storage.rollout_storage.truncations[-1] = 1.0
+            self.storage.off_policy_storage.truncations[-1] = 1.0
+
 
     def compute_returns(self, obs: TensorDict) -> None:
-        st = self.storage
-        last_action = self.policy.act(obs).detach()
-        last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
+        self.process_buffer_transitions()
+        # First iterate over the on-policy transitions
+        st = self.storage.rollout_storage
+        last_values = st.values[-1]
         recurr_value = 0.0
 
         td_target = last_values
-        for step in reversed(range(st.num_transitions_per_env)):
+        for step in reversed(range(st.num_transitions_per_env-1)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
             # True terminals should zero out the bootstrap.
@@ -226,6 +261,56 @@ class REPPO:
             td_target = torch.where(is_truncated, st.values[step],  td_target)
             recurr_value = next_is_not_terminal * (self.gamma * recurr_value + st.rewards[step])
             st.clean_returns[step] = recurr_value
+
+        # Now iterate over the off-policy transitions
+        st = self.storage.off_policy_storage
+        last_values = st.values[-1]
+        recurr_value = 0.0
+
+        td_target = last_values
+        for step in reversed(range(st.num_transitions_per_env-1)):
+            # If we are at the last step, bootstrap the return value
+            next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+            # True terminals should zero out the bootstrap.
+            is_truncated = st.truncations[step].bool()
+            next_is_not_terminal = 1.0 - st.dones[step]
+            offp_correction = torch.clamp(torch.exp(st.curr_log_prob[step] - st.actions_log_prob[step]), min=0.0, max=1.0)
+            lam = self.lam * offp_correction
+            lambda_sum = (1.0 - lam) * next_values + lam * td_target
+            if self.run_td3:
+                td_target = st.rewards[step] + next_is_not_terminal * self.gamma * lambda_sum
+            else:
+                td_target = st.soft_rewards[step] + next_is_not_terminal * self.gamma * lambda_sum
+            st.returns[step] = td_target
+            td_target = torch.where(is_truncated, st.values[step],  td_target)
+            recurr_value = next_is_not_terminal * (self.gamma * recurr_value + st.rewards[step])
+            st.clean_returns[step] = recurr_value
+
+    def _compute_storage_metrics(self, st) -> dict:
+        """Compute diagnostic metrics from a RolloutStorage instance."""
+        is_true_terminal = st.dones.bool() & ~st.truncations.bool()
+        is_orphan_truncation = st.truncations.bool() & ~st.dones.bool()
+        is_double_terminal = st.dones.bool() & st.truncations.bool()
+        return {
+            "returns_mean": st.returns.mean().item(),
+            "returns_std": st.returns.std().item(),
+            "returns_min": st.returns.min().item(),
+            "returns_max": st.returns.max().item(),
+            "clean_returns_mean": st.clean_returns[0].mean().item(),
+            "clean_returns_std": st.clean_returns[0].std().item(),
+            "clean_returns_min": st.clean_returns[0].min().item(),
+            "clean_returns_max": st.clean_returns[0].max().item(),
+            "rewards_mean": st.rewards.mean().item(),
+            "rewards_std": st.rewards.std().item(),
+            "soft_rewards_mean": st.soft_rewards.mean().item(),
+            "num_true_terminations": is_true_terminal.sum().item(),
+            "num_truncations": st.truncations.sum().item(),
+            "num_orphan_truncations": is_orphan_truncation.sum().item(),
+            "num_double_terminations": is_double_terminal.sum().item(),
+            "action_min": st.actions.min().item(),
+            "action_max": st.actions.max().item(),
+            "action_mean": st.actions.mean().item(),
+        }
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -250,32 +335,9 @@ class REPPO:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
-        # Compute return statistics before update (for diagnostics)
-        returns_mean = self.storage.returns.mean().item()
-        returns_std = self.storage.returns.std().item()
-        returns_min = self.storage.returns.min().item()
-        returns_max = self.storage.returns.max().item()
-
-        # Compute clean returns
-        clean_returns_mean = self.storage.clean_returns[0].mean().item()
-        clean_returns_std = self.storage.clean_returns[0].std().item()
-        clean_returns_min = self.storage.clean_returns[0].min().item()
-        clean_returns_max = self.storage.clean_returns[0].max().item()
-        
-        # Compute reward statistics
-        rewards_mean = self.storage.rewards.mean().item()
-        rewards_std = self.storage.rewards.std().item()
-        soft_rewards_mean = self.storage.soft_rewards.mean().item()
-        
-        # Compute termination statistics
-        # Note: truncation should always imply done (dones = terminated | truncated)
-        # but we check for "orphan" truncations just in case
-        is_true_terminal = self.storage.dones.bool() & ~self.storage.truncations.bool()
-        is_orphan_truncation = self.storage.truncations.bool() & ~self.storage.dones.bool()
-        is_double_terminal = self.storage.dones.bool() & self.storage.truncations.bool()
-        num_true_terminations = is_true_terminal.sum().item()
-        num_truncations = self.storage.truncations.sum().item()
-        num_orphan_truncations = is_orphan_truncation.sum().item()
+        # Compute per-storage diagnostics before the update
+        op_m = self._compute_storage_metrics(self.storage.rollout_storage)
+        offp_m = self._compute_storage_metrics(self.storage.off_policy_storage)
 
         # checkpoint critic params
         critic_params = copy.deepcopy((
@@ -308,6 +370,7 @@ class REPPO:
             hidden_states_batch,
             masks_batch,
             valid_mask,
+            off_policy_marker,
         ) in enumerate(generator):
             # Build minibatch dict
             minibatch = {
@@ -318,6 +381,7 @@ class REPPO:
                 "masks_batch": masks_batch,
                 "valid_mask": valid_mask,
                 "dones_batch": dones_batch,
+                "off_policy_marker": off_policy_marker,
             }
 
             # Update critic
@@ -369,20 +433,13 @@ class REPPO:
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
-        # Clear the storage
-        self.storage.clear()
-
-        action_min = self.storage.actions.min()
-        action_max = self.storage.actions.max()
-        action_mean = self.storage.actions.mean()
-
         # Construct the loss dictionary
         loss_dict = {
             # Core losses
             "loss/value": mean_value_loss,
             "loss/surrogate": mean_surrogate_loss,
             "loss/primary_policy": mean_primary_policy_loss,
-            
+
             # Entropy/KL metrics
             "policy/entropy": mean_entropy,
             "policy/kl_divergence": mean_kl_divergence,
@@ -391,16 +448,16 @@ class REPPO:
             "policy/kl_max": mean_kl_max,
             "policy/alpha_temp": self.policy.alpha_temp.item(),
             "policy/alpha_kl": self.policy.alpha_kl.item(),
-            
-            # Value/return statistics
-            "value/returns_mean": returns_mean,
-            "value/returns_std": returns_std,
-            "value/returns_min": returns_min,
-            "value/returns_max": returns_max,
-            "value/clean_returns_mean": clean_returns_mean,
-            "value/clean_returns_std": clean_returns_std,
-            "value/clean_returns_min": clean_returns_min,
-            "value/clean_returns_max": clean_returns_max,
+
+            # On-policy value/return statistics
+            "value/returns_mean": op_m["returns_mean"],
+            "value/returns_std": op_m["returns_std"],
+            "value/returns_min": op_m["returns_min"],
+            "value/returns_max": op_m["returns_max"],
+            "value/clean_returns_mean": op_m["clean_returns_mean"],
+            "value/clean_returns_std": op_m["clean_returns_std"],
+            "value/clean_returns_min": op_m["clean_returns_min"],
+            "value/clean_returns_max": op_m["clean_returns_max"],
             "value/q_std": mean_q_value_std,
             "value/pred_error": mean_value_pred_error,
             "value/pred_std": mean_value_pred_std,
@@ -412,18 +469,25 @@ class REPPO:
             "value/critic_q_max": critic_metrics["max_q"],
             "value/critic_q_mean": critic_metrics["mean_q"],
             "value/critic_pred_error": critic_metrics["value_prediction_error"],
-            
-            # Reward statistics
-            "env/rewards_mean": rewards_mean,
-            "env/rewards_std": rewards_std,
-            "env/soft_rewards_mean": soft_rewards_mean,
-            
-            # Termination statistics
-            "env/true_terminations": num_true_terminations,
-            "env/truncations": num_truncations,
-            "env/orphan_truncations": num_orphan_truncations,
-            "env/double_terminations": is_double_terminal.sum(),
-            
+
+            # On-policy reward statistics
+            "env/rewards_mean": op_m["rewards_mean"],
+            "env/rewards_std": op_m["rewards_std"],
+            "env/soft_rewards_mean": op_m["soft_rewards_mean"],
+
+            # On-policy termination statistics
+            "env/true_terminations": op_m["num_true_terminations"],
+            "env/truncations": op_m["num_truncations"],
+            "env/orphan_truncations": op_m["num_orphan_truncations"],
+            "env/double_terminations": op_m["num_double_terminations"],
+
+            # Off-policy statistics
+            "off_policy/returns_mean": offp_m["returns_mean"],
+            "off_policy/rewards_mean": offp_m["rewards_mean"],
+            "off_policy/soft_rewards_mean": offp_m["soft_rewards_mean"],
+            "off_policy/true_terminations": offp_m["num_true_terminations"],
+            "off_policy/truncations": offp_m["num_truncations"],
+
             # Gradient statistics
             "optim/actor_grad_norm": mean_actor_grad_norm,
             "optim/critic_grad_norm": mean_critic_grad_norm,
@@ -433,20 +497,22 @@ class REPPO:
             "env/obs_max": critic_metrics["max_obs"],
             "env/obs_norm_min": critic_metrics["min_norm_obs"],
             "env/obs_norm_max": critic_metrics["max_norm_obs"],
-            
+
             # Policy distribution statistics
             "policy/action_std_mean": mean_action_std_mean,
             "policy/action_std_min": mean_action_std_min,
             "policy/action_std_max": mean_action_std_max,
             "policy/action_mean_abs": mean_action_mean_abs,
-            "policy/action_min": action_min,
-            "policy/action_max": action_max,
-            "policy/action_mean": action_mean,
+            "policy/action_min": op_m["action_min"],
+            "policy/action_max": op_m["action_max"],
+            "policy/action_mean": op_m["action_mean"],
         }
         if self.rnd:
             loss_dict["aux/rnd_loss"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["aux/symmetry_loss"] = mean_symmetry_loss
+
+        self.storage.clear()
 
         # get updated critic params
         updated_critic_params = (
@@ -461,10 +527,11 @@ class REPPO:
         return loss_dict
 
     def update_actor(self, minibatch: dict) -> dict:
-        obs_batch = minibatch["obs_batch"]
-        hidden_states_batch = minibatch["hidden_states_batch"]
-        masks_batch = minibatch["masks_batch"]
-        valid_mask = minibatch["valid_mask"]
+        off_policy_mask = minibatch["off_policy_marker"]
+        obs_batch = minibatch["obs_batch"][off_policy_mask.bool()]
+        hidden_states_batch = minibatch["hidden_states_batch"][off_policy_mask.bool()]
+        masks_batch = minibatch["masks_batch"][off_policy_mask.bool()]
+        valid_mask = minibatch["valid_mask"][off_policy_mask.bool()]
 
         self.policy.act(obs_batch, hidden_states_batch, masks_batch)
         predicted_policy = self.policy.distribution

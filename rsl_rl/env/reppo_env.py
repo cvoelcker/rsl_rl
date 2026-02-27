@@ -16,12 +16,27 @@ class IsaacLabEnv:
         num_envs: int,
         seed: int,
         action_bounds: Optional[float] = None,
+        terrain_levels: str | int = "auto",
     ):
         env_cfg = parse_env_cfg(
             task_name,
             device=device,
             num_envs=num_envs,
         )
+        env_cfg.curriculum = None
+        if (
+            getattr(env_cfg, "scene", None) is not None
+            and getattr(env_cfg.scene, "terrain", None) is not None
+            and getattr(env_cfg.scene.terrain, "terrain_generator", None) is not None
+        ):
+            terrain_generator = env_cfg.scene.terrain.terrain_generator
+            if terrain_levels == "auto":
+                env_cfg.scene.terrain.max_init_terrain_level = terrain_generator.num_rows - 1
+            elif isinstance(terrain_levels, int):
+                env_cfg.scene.terrain.max_init_terrain_level = terrain_levels
+            else:
+                raise ValueError("terrain_levels must be 'auto' or an int.")
+            env_cfg.scene.terrain.terrain_generator.curriculum = False
         env_cfg.seed = seed
         self.seed = seed
         self.envs = gym.make(task_name, cfg=env_cfg, render_mode=None)
@@ -57,6 +72,7 @@ class IsaacLabEnv:
             "num_envs": num_envs,
             "seed": seed,
             "action_bounds": action_bounds,
+            "terrain_levels": terrain_levels,
         }
 
     def reset(self, random_start_init: bool = False) -> torch.Tensor:

@@ -53,6 +53,7 @@ def make_reppo_isaac_env(
     device: str,
     num_envs: int,
     seed: int,
+    terrain_levels: int | str ,
     action_bounds: float | None = None,
 ) -> VecEnv:
     """Create an Isaac Lab environment via the Reppo wrapper and adapt it to `rsl_rl.env.VecEnv`."""
@@ -64,6 +65,7 @@ def make_reppo_isaac_env(
         num_envs=num_envs,
         seed=seed,
         action_bounds=action_bounds,
+        terrain_levels=terrain_levels,
     )
     return env
 

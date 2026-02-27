@@ -112,13 +112,13 @@ class MLP(nn.Sequential):
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
         if use_layer_norm:
-            layers.append(nn.RMSNorm(hidden_dims_processed[0]))
+            layers.append(nn.RMSNorm(hidden_dims_processed[0], elementwise_affine=False))
         layers.append(activation_mod())
 
         for layer_index in range(len(hidden_dims_processed) - 1):
             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
             if use_layer_norm:
-                layers.append(nn.RMSNorm(hidden_dims_processed[layer_index + 1]))
+                layers.append(nn.RMSNorm(hidden_dims_processed[layer_index + 1], elementwise_affine=False))
             layers.append(activation_mod())
 
         if add_sem:

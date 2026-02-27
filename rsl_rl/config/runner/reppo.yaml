@@ -22,18 +22,18 @@ wandb_project: legged_gym
 policy:
   class_name: ActorQ
   activation: elu
-  actor_obs_normalization: false
-  critic_obs_normalization: false
+  actor_obs_normalization: true
+  critic_obs_normalization: true
   actor_hidden_dims: [256, 256, 256]
-  critic_hidden_dims: [512, 512, 512]
+  critic_hidden_dims: [256, 256, 256]
   num_critic_bins: 151
   vmin: -10.0
   vmax: 10.0
   init_noise_std: 1.0
   noise_std_type: log
-  state_dependent_std:  true
-  distribution_type: tanh  # normal or tanh
-  init_alpha_temp: 0.001
+  state_dependent_std: false
+  distribution_type: normal  # normal or tanh
+  init_alpha_temp: 0.0001
   init_alpha_kl: 0.01
   init_alpha_mean: 0.01
   num_kl_samples: 16
@@ -47,21 +47,24 @@ policy:
 algorithm:
   class_name: REPPO
   learning_rate: 0.0003
+  temp_learning_rate: 0.00003
   num_learning_epochs: 8
-  num_mini_batches: 32
-  desired_kl: 0.1
-  target_entropy: -0.0
+  num_mini_batches: 16
+  desired_kl: 0.01
+  target_entropy: -0.5
   gamma: 0.97
   lam: 0.95
-  max_grad_norm: 100.0
+  max_grad_norm: 10.0
   schedule: fixed
   run_td3: false
   use_relative_kl: false
   reverse_kl: false
-  scale_actions: true
+  scale_actions: false
   action_scale_method: policy  # runner or policy
   action_scale_bounds: provided  # provided or env
   action_lower_bound: -20.0
   action_upper_bound: 20.0
   rnd_cfg: null
   symmetry_cfg: null
+  actor_lr_multiplier: 1.0
+  off_policy: False

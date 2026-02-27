@@ -5,6 +5,6 @@
 
 """Implementation of transitions storage for RL-agent."""
 
-from .rollout_storage import RolloutStorage, Transition
+from .rollout_storage import RolloutStorage, Transition, HybridRolloutStorage
 
-__all__ = ["RolloutStorage", "Transition"]
+__all__ = ["RolloutStorage", "Transition", "HybridRolloutStorage"]

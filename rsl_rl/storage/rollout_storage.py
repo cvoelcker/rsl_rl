@@ -60,7 +60,7 @@ class RolloutStorage:
 
         # Core
         self.observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
+            {key: torch.zeros(num_transitions_per_env, num_envs, *value.shape[1:], device=device) for key, value in obs.items()},
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
@@ -78,6 +78,7 @@ class RolloutStorage:
         if training_type == "rl":
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.curr_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
@@ -87,6 +88,9 @@ class RolloutStorage:
         # For RNN networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
+
+        self.filled_indices = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.max_filled_index = 0
 
         # Counter for the number of transitions stored
         self.step = 0
@@ -122,8 +126,9 @@ class RolloutStorage:
         # Increment the counter
         self.step += 1
 
-    def clear(self) -> None:
-        self.step = 0
+        # mark as filled up to the current step for all environments (since we add transitions for all envs at once)
+        self.filled_indices[:transition.observations.shape[0]] = 1
+        self.max_filled_index = max(self.max_filled_index, transition.observations.shape[0])
 
     # For distillation
     def generator(self) -> Generator:
@@ -139,22 +144,22 @@ class RolloutStorage:
             raise ValueError("This function is only available for reinforcement learning training.")
 
         # Flatten all data
-        observations = self.observations.flatten(0, 1)
-        actions = self.actions.flatten(0, 1)
-        values = self.values.flatten(0, 1)
-        returns = self.returns.flatten(0, 1)
-        clean_returns = self.clean_returns.flatten(0, 1)
-        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
-        old_mu = self.mu.flatten(0, 1)
-        old_sigma = self.sigma.flatten(0, 1)
+        # select only from valid rows (where filled_indices is 1) to avoid including uninitialized data in the batches
+        observations = self.observations[:, :self.max_filled_index].flatten(0, 1)
+        actions = self.actions[:, :self.max_filled_index].flatten(0, 1)
+        values = self.values[:, :self.max_filled_index].flatten(0, 1)
+        returns = self.returns[:, :self.max_filled_index].flatten(0, 1)
+        clean_returns = self.clean_returns[:, :self.max_filled_index].flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob[:, :self.max_filled_index].flatten(0, 1)
+        advantages = self.advantages[:, :self.max_filled_index].flatten(0, 1)
+        old_mu = self.mu[:, :self.max_filled_index].flatten(0, 1)
+        old_sigma = self.sigma[:, :self.max_filled_index].flatten(0, 1)
 
-        termination = self.dones.flatten(0, 1)
-        truncation = self.truncations.flatten(0, 1)
+        termination = self.dones[:, :self.max_filled_index].flatten(0, 1)
         dones = termination
 
         # Mask out truncated transitions (they have invalid value targets)
-        truncation_mask = ~self.truncations.flatten(0, 1).squeeze(-1).bool()
+        truncation_mask = ~self.truncations[:, :self.max_filled_index].flatten(0, 1).squeeze(-1).bool()
         valid_indices = torch.nonzero(truncation_mask, as_tuple=False).squeeze(-1)
         # valid_indices = torch.ones_like(valid_indices)
         num_valid = valid_indices.shape[0]
@@ -297,6 +302,9 @@ class RolloutStorage:
 
                 first_traj = last_traj
 
+    def clear(self) -> None:
+        self.step = 0
+
     def _save_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
         if hidden_states == (None, None):
             return
@@ -319,15 +327,151 @@ class RolloutStorage:
             self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])
 
 
-class HybridStorage:
-    """Stoarge for hybrid on-policy off-policy replay buffers."""
+class HybridRolloutStorage:
+    """Storage for hybrid on-policy off-policy replay buffers."""
 
     def __init__(
         self,
         num_envs: int,
         num_transitions_per_env: int,
+        num_off_policy_trajectories: int,
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
     ) -> None:
-        pass
+        
+        self.rollout_storage = RolloutStorage(
+            training_type="rl",
+            num_envs=num_envs,
+            num_transitions_per_env=num_transitions_per_env,
+            obs=obs,
+            actions_shape=actions_shape,
+            device=device,
+        )
+        self.off_policy_storage = RolloutStorage(
+            training_type="rl",
+            num_envs=num_off_policy_trajectories,
+            num_transitions_per_env=num_transitions_per_env,
+            obs=obs,
+            actions_shape=actions_shape,
+            device=device,
+        )
+        self.off_policy_add_index = 0
+
+        self.num_envs = num_envs
+        self.num_transitions_per_env = num_transitions_per_env
+
+
+    def add_transition(self, transition: Transition) -> None:
+        self.rollout_storage.add_transition(transition)
+
+    def _copy_env_columns(self, src, dst, src_env_slice, dst_env_indices) -> None:
+        """Copy env-dimension columns from src storage to dst storage.
+
+        Tensors in RolloutStorage are shaped [T, N, ...]. This helper selects
+        env columns src[:, src_env_slice] and writes them to dst[:, dst_env_indices].
+        TensorDict observations are handled key-by-key since fancy env-dim indexing
+        does not support in-place assignment via TensorDict directly.
+        """
+        for key in src.observations.keys():
+            dst.observations[key][:, dst_env_indices] = src.observations[key][:, src_env_slice]
+        dst.actions[:, dst_env_indices] = src.actions[:, src_env_slice]
+        dst.rewards[:, dst_env_indices] = src.rewards[:, src_env_slice]
+        dst.dones[:, dst_env_indices] = src.dones[:, src_env_slice]
+        dst.truncations[:, dst_env_indices] = src.truncations[:, src_env_slice]
+        dst.values[:, dst_env_indices] = src.values[:, src_env_slice]
+        dst.actions_log_prob[:, dst_env_indices] = src.actions_log_prob[:, src_env_slice]
+        dst.mu[:, dst_env_indices] = src.mu[:, src_env_slice]
+        dst.sigma[:, dst_env_indices] = src.sigma[:, src_env_slice]
+        dst.returns[:, dst_env_indices] = src.returns[:, src_env_slice]
+        dst.clean_returns[:, dst_env_indices] = src.clean_returns[:, src_env_slice]
+        dst.advantages[:, dst_env_indices] = src.advantages[:, src_env_slice]
+
+    def select_for_off_policy_storage(self) -> None:
+        if self.off_policy_storage.max_filled_index < self.off_policy_storage.num_envs:
+            # Buffer not yet full: fill new slots up to capacity.
+            n_new = min(
+                self.off_policy_storage.num_envs - self.off_policy_storage.max_filled_index,
+                self.rollout_storage.num_envs,
+            )
+            dst_start = self.off_policy_storage.max_filled_index
+            add_indices = torch.arange(dst_start, dst_start + n_new, device=self.off_policy_storage.device)
+            self._copy_env_columns(
+                src=self.rollout_storage,
+                dst=self.off_policy_storage,
+                src_env_slice=slice(0, n_new),
+                dst_env_indices=add_indices,
+            )
+            self.off_policy_storage.filled_indices[add_indices] = 1
+            self.off_policy_storage.max_filled_index = dst_start + n_new
+            self.off_policy_add_index = (dst_start + n_new) % self.off_policy_storage.num_envs
+
+        else:
+            # Buffer full: overwrite circularly.
+            # TODO: smarter eviction policy (e.g. prioritised replay) can be added here.
+            add_indices = (
+                torch.arange(self.rollout_storage.num_envs, device=self.off_policy_storage.device)
+                + self.off_policy_add_index
+            ) % self.off_policy_storage.num_envs
+            self._copy_env_columns(
+                src=self.rollout_storage,
+                dst=self.off_policy_storage,
+                src_env_slice=slice(None),  # all rollout envs
+                dst_env_indices=add_indices,
+            )
+            self.off_policy_add_index = (
+                self.off_policy_add_index + self.rollout_storage.num_envs
+            ) % self.off_policy_storage.num_envs
+
+    def clear(self) -> None:
+        self.rollout_storage.clear()
+
+    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
+        # get's half a batch from on-policy data and half from off-policy data
+
+        #compute minibatch size in on-policy storage
+        on_policy_minibatch_size = self.rollout_storage.num_envs * self.rollout_storage.num_transitions_per_env // num_mini_batches
+        # now compute how many minibatches we need to obtain from the off-policy storage to match the on-policy batch size
+        num_off_policy_batches = self.off_policy_storage.max_filled_index * self.off_policy_storage.num_transitions_per_env // on_policy_minibatch_size
+
+        on_policy_generator = self.rollout_storage.mini_batch_generator(num_mini_batches, num_epochs)
+        off_policy_generator = self.off_policy_storage.mini_batch_generator(num_off_policy_batches, num_epochs)
+        for on_policy_batch, off_policy_batch in zip(on_policy_generator, off_policy_generator):
+            # merge batches
+            obs_batch = torch.cat([on_policy_batch[0], off_policy_batch[0]], dim=0)
+            actions_batch = torch.cat([on_policy_batch[1], off_policy_batch[1]], dim=0)
+            target_values_batch = torch.cat([on_policy_batch[2], off_policy_batch[2]], dim=0)
+            advantages_batch = torch.cat([on_policy_batch[3], off_policy_batch[3]],
+                                        dim=0)
+            returns_batch = torch.cat([on_policy_batch[4], off_policy_batch[4]], dim=0)
+            clean_returns_batch = torch.cat([on_policy_batch[5], off_policy_batch[5]], dim=0)
+            old_actions_log_prob_batch = torch.cat([on_policy_batch[6], off_policy_batch[6]], dim=0)
+            old_mu_batch = torch.cat([on_policy_batch[7], off_policy_batch[7]], dim=0)
+            old_sigma_batch = torch.cat([on_policy_batch[8], off_policy_batch[8]], dim=0)
+            dones_batch = torch.cat([on_policy_batch[9], off_policy_batch[9]], dim=0)
+            # Hidden states, masks and valid_mask are None for feedforward policies.
+            # TODO: to support recurrent policies here, RolloutStorage.mini_batch_generator
+            # (used by both ppo.py and reppo.py) must be updated to yield non-None hidden
+            # states and masks, and the concatenation logic below must be updated accordingly.
+            hidden_states_batch = (None, None)
+            masks_batch = None
+            valid_mask_batch = None
+            yield (
+                obs_batch,
+                actions_batch,
+                target_values_batch,
+                advantages_batch,
+                returns_batch,
+                clean_returns_batch,
+                old_actions_log_prob_batch,
+                old_mu_batch,
+                old_sigma_batch,
+                dones_batch,
+                hidden_states_batch,
+                masks_batch,
+                valid_mask_batch,
+                (torch.cat([
+                    torch.ones(on_policy_batch[0].shape[0], dtype=torch.bool, device=obs_batch.device),
+                    torch.zeros(off_policy_batch[0].shape[0], dtype=torch.bool, device=obs_batch.device)
+                ]))
+            )

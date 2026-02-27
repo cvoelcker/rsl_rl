@@ -35,6 +35,7 @@ env:
     num_envs: 4096
     device: cuda
     seed: ${seed}
+    terrain_levels: 0
 
 hydra:
   job:
