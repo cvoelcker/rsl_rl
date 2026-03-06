@@ -237,9 +237,14 @@ class ActorQ(nn.Module):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         if self.state_dependent_std:
-            return self.actor(obs)[..., 0, :]
+            mean = self.actor(obs)[..., 0, :]
         else:
-            return self.actor(obs)
+            mean = self.actor(obs)
+        if self.distribution_type == "tanh":
+            mean_offset = (self.action_upper_bound + self.action_lower_bound) / 2.0
+            scale = (self.action_upper_bound - self.action_lower_bound) / 2.0
+            return mean_offset + scale * torch.tanh(mean)
+        return mean
 
     def evaluate(self, obs: TensorDict, act: Tensor, *args, return_logits: bool = False) -> torch.Tensor:
         obs = self.get_critic_obs(obs)
