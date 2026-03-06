@@ -36,9 +36,14 @@ class TanhNormal(TransformedDistribution):
         if self.action_bounds_lower is not None and self.action_bounds_upper is not None:
             self._mean_offset = (self.action_bounds_upper + self.action_bounds_lower) / 2.0
             self._scale = (self.action_bounds_upper - self.action_bounds_lower) / 2.0
+            # Convert to tensor if they're not already
+            if not isinstance(self._mean_offset, Tensor):
+                self._mean_offset = torch.tensor(self._mean_offset, dtype=loc.dtype, device=loc.device)
+            if not isinstance(self._scale, Tensor):
+                self._scale = torch.tensor(self._scale, dtype=loc.dtype, device=loc.device)
         else:
-            self._mean_offset = 0.0
-            self._scale = 1.0
+            self._mean_offset = torch.tensor(0.0, dtype=loc.dtype, device=loc.device)
+            self._scale = torch.tensor(1.0, dtype=loc.dtype, device=loc.device)
         base_dist = Normal(loc, scale, validate_args=validate_args)
         # cache_size=1 caches the transform for rsample -> log_prob pattern
         super().__init__(base_dist, TanhTransform(cache_size=1), validate_args=validate_args)
